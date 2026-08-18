@@ -13,13 +13,15 @@ if [[ ! -f "$BENCH/inpaint_worker.py" ]]; then
   exit 1
 fi
 
-if [[ -x /root/anaconda3/envs/pano-lama/bin/python ]]; then
+# iopaint 1.6.0 需要 Python 3.11（Pillow 9.5 无 3.12 wheel）。不要用 pano-lama 的 3.12。
+if [[ -x /root/anaconda3/bin/python ]]; then
+  PYTHON_BIN="${PYTHON_BIN:-/root/anaconda3/bin/python}"
+elif command -v python3.11 >/dev/null 2>&1; then
+  PYTHON_BIN="${PYTHON_BIN:-$(command -v python3.11)}"
+elif [[ -x /root/anaconda3/envs/pano-lama/bin/python ]]; then
   PYTHON_BIN="${PYTHON_BIN:-/root/anaconda3/envs/pano-lama/bin/python}"
-elif [[ -x "$DEMO/.venv/bin/python" ]]; then
-  PYTHON_BIN="${PYTHON_BIN:-$DEMO/.venv/bin/python}"
-  PYTHON_BIN="$("$PYTHON_BIN" -c 'import sys; print(sys.executable)')"
 else
-  PYTHON_BIN="${PYTHON_BIN:-python3.12}"
+  PYTHON_BIN="${PYTHON_BIN:-python3}"
 fi
 
 echo "[pp] bench=$BENCH"
@@ -28,17 +30,31 @@ echo "[pp] python=$PYTHON_BIN"
 export PYTHON="$PYTHON_BIN"
 export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
 chmod +x "$BENCH/setup.sh"
-(cd "$BENCH" && ./setup.sh)
 
-if command -v nvidia-smi >/dev/null 2>&1; then
-  echo "[pp] 安装 CUDA 版 torch，避免 iopaint 拉来 CPU 轮子"
-  "$BENCH/.venv/bin/pip" install torch torchvision --index-url "${TORCH_INDEX:-https://download.pytorch.org/whl/cu124}"
+venv_ok() {
   "$BENCH/.venv/bin/python" - <<'PY'
+import iopaint, torch
+assert torch.cuda.is_available()
+print(f"[pp] 已有环境 torch={torch.__version__} cuda=True，跳过 setup")
+PY
+}
+
+if [[ "${SKIP_SETUP:-0}" == "1" ]] || venv_ok; then
+  :
+else
+  (cd "$BENCH" && ./setup.sh)
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    if ! "$BENCH/.venv/bin/python" -c 'import torch; raise SystemExit(0 if torch.cuda.is_available() else 1)'; then
+      echo "[pp] 安装 CUDA 版 torch，避免 iopaint 拉来 CPU 轮子"
+      "$BENCH/.venv/bin/pip" install torch torchvision --index-url "${TORCH_INDEX:-https://download.pytorch.org/whl/cu124}"
+    fi
+    "$BENCH/.venv/bin/python" - <<'PY'
 import torch
 print(f"[pp] torch={torch.__version__} cuda={torch.cuda.is_available()}")
 if not torch.cuda.is_available():
     raise SystemExit("PowerPaint 环境 CUDA 不可用")
 PY
+  fi
 fi
 
 ENVF="$DEMO/server.env"
