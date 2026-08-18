@@ -289,15 +289,35 @@ def union_rect_mask(mask: Image.Image | None, size: tuple[int, int], rect: tuple
     return Image.fromarray(arr, mode="L")
 
 
-def run_sam_on_points(original: Image.Image, points: list[tuple[int, int, int]]) -> Image.Image:
+_SAM_EMBED_KEY: tuple | None = None
+
+
+def _ensure_sam_embedding(original_img, original: Image.Image) -> float:
+    """同一张原图多次点选时复用 SAM 图像编码，避免每次 set_image。"""
+    global _SAM_EMBED_KEY
+    predictor = get_sam_predictor()
+    sam_img, scale = _resize_max_side(original, SAM_MAX_SIDE)
+    key: tuple | None = None
+    if isinstance(original_img, (str, Path)):
+        p = Path(original_img)
+        try:
+            st = p.stat()
+            key = (str(p.resolve()), st.st_mtime_ns, st.st_size, sam_img.size)
+        except OSError:
+            key = None
+    if key is None or key != _SAM_EMBED_KEY:
+        predictor.set_image(np.array(sam_img.convert("RGB")))
+        _SAM_EMBED_KEY = key
+    return scale
+
+
+def run_sam_on_points(original_img, original: Image.Image, points: list[tuple[int, int, int]]) -> Image.Image:
     """points: [(x,y,label)] 原图像素坐标，label 1=正点 0=负点。"""
     if not points:
         raise gr.Error("请先在图上点击人像（可多点）")
 
     predictor = get_sam_predictor()
-    sam_img, scale = _resize_max_side(original, SAM_MAX_SIDE)
-    rgb = np.array(sam_img.convert("RGB"))
-    predictor.set_image(rgb)
+    scale = _ensure_sam_embedding(original_img, original)
 
     coords = np.array([[p[0] * scale, p[1] * scale] for p in points], dtype=np.float32)
     labels = np.array([p[2] for p in points], dtype=np.int32)
@@ -315,12 +335,10 @@ def run_sam_on_points(original: Image.Image, points: list[tuple[int, int, int]])
     return Image.fromarray(mask_full, mode="L")
 
 
-def run_sam_on_box(original: Image.Image, box_xyxy: tuple[int, int, int, int]) -> Image.Image:
+def run_sam_on_box(original_img, original: Image.Image, box_xyxy: tuple[int, int, int, int]) -> Image.Image:
     """用 SAM box prompt 分割矩形内目标。"""
     predictor = get_sam_predictor()
-    sam_img, scale = _resize_max_side(original, SAM_MAX_SIDE)
-    rgb = np.array(sam_img.convert("RGB"))
-    predictor.set_image(rgb)
+    scale = _ensure_sam_embedding(original_img, original)
     x1, y1, x2, y2 = box_xyxy
     box = np.array([x1 * scale, y1 * scale, x2 * scale, y2 * scale], dtype=np.float32)
 
@@ -388,15 +406,14 @@ def on_sam_click(
     rects = list(rects_state or [])
     rect_mask = _as_mask_image(rect_mask_img)
 
-    points_mask = run_sam_on_points(original, points)
+    points_mask = run_sam_on_points(original_img, original, points)
     mask = _union_masks(points_mask, rect_mask, original.size)
     vis = overlay_mask_preview(original, mask, points, rects, rect_pending)
-    editor = _compose_editor(original, mask)
     status = (
         f"SAM 已更新：{len(points)} 个点（最近 {'正' if label == 1 else '负'}点 @ ({ox},{oy})）。"
-        "可继续点击，或切换「矩形框」，或到画板笔刷精修。"
+        "可继续点击。笔刷画板不会每次回传，精修前请点「载入当前 Mask 到笔刷」。"
     )
-    return points, rects, rect_pending, rect_mask, vis, editor, mask, status
+    return points, rects, rect_pending, rect_mask, vis, mask, status
 
 
 def on_rect_click(
@@ -425,20 +442,20 @@ def on_rect_click(
         pending = (ox, oy)
         vis = overlay_mask_preview(original, combined, points, rects, pending)
         status = f"矩形起点已定 @ ({ox},{oy})，请再点对角终点完成框选。"
-        return points, rects, pending, rect_mask, vis, _compose_editor(original, combined), combined, status
+        return points, rects, pending, rect_mask, vis, combined, status
 
     x1, y1, x2, y2 = _normalize_rect(pending[0], pending[1], ox, oy)
     if x2 - x1 < 4 or y2 - y1 < 4:
         vis = overlay_mask_preview(original, combined, points, rects, pending)
         status = "矩形太小，请重新点击更大的对角区域。"
-        return points, rects, pending, rect_mask, vis, _compose_editor(original, combined), combined, status
+        return points, rects, pending, rect_mask, vis, combined, status
 
     rect = (x1, y1, x2, y2)
     rects.append(rect)
     pending = None
 
     if rect_use_sam:
-        box_mask = run_sam_on_box(original, rect)
+        box_mask = run_sam_on_box(original_img, original, rect)
         rect_mask = _union_masks(rect_mask, box_mask, original.size)
         how = "SAM 框内分割"
     else:
@@ -446,11 +463,11 @@ def on_rect_click(
         how = "整框填色"
 
     # 与已有 SAM 点选结果合并（若有）
-    points_mask = run_sam_on_points(original, points) if points else None
+    points_mask = run_sam_on_points(original_img, original, points) if points else None
     mask = _union_masks(points_mask, rect_mask, original.size)
     vis = overlay_mask_preview(original, mask, points, rects, pending)
-    status = f"已添加矩形 #{len(rects)} [{how}] ({x1},{y1})-({x2},{y2})。可继续画框，或到画板笔刷精修。"
-    return points, rects, pending, rect_mask, vis, _compose_editor(original, mask), mask, status
+    status = f"已添加矩形 #{len(rects)} [{how}] ({x1},{y1})-({x2},{y2})。可继续画框。精修前请载入 Mask 到笔刷。"
+    return points, rects, pending, rect_mask, vis, mask, status
 
 
 def on_interact_click(
@@ -481,7 +498,18 @@ def on_interact_click(
     )
 
 
+def sync_brush_editor(original_img, sam_mask_img):
+    """仅在用户要笔刷精修时把 Mask 写入画板，避免每次点选回传 ImageEditor。"""
+    original = _to_pil_rgb(original_img)
+    if original is None:
+        raise gr.Error("请先上传全景原图")
+    mask = _as_mask_image(sam_mask_img)
+    return _compose_editor(original, mask)
+
+
 def clear_sam(original_img):
+    global _SAM_EMBED_KEY
+    _SAM_EMBED_KEY = None
     original = _to_pil_rgb(original_img)
     points: list = []
     rects: list = []
@@ -586,6 +614,8 @@ def remove_person(
 
 def load_original(img):
     """上传原图后：刷新预览与空画板。"""
+    global _SAM_EMBED_KEY
+    _SAM_EMBED_KEY = None
     pil = _to_pil_rgb(img)
     stem = _image_stem(img)
     if pil is None:
@@ -642,9 +672,9 @@ with gr.Blocks(title="全景人像消除 · SAM + 可切换修复模型") as dem
         2. 选标注模式后，在中间 **标注区**（蓝色标题那张图）上操作——**不是**下面带笔刷工具栏的画板  
            - **SAM 点选**：单击人像  
            - **矩形框**：点两个**对角点**定框（会出现青色矩形）  
-        3. 需要修边时再展开「笔刷精修」  
+        3. 需要修边时再展开「笔刷精修」，点「载入当前 Mask 到笔刷」  
         4. 选修复模型后开始消除 → `output/原图名_模型_时间.jpg`  
-           Mask 共用，换模型不必重新点选。
+           Mask 共用，换模型不必重新点选。点选只传坐标，不回传画板。
         """
     )
 
@@ -702,10 +732,12 @@ with gr.Blocks(title="全景人像消除 · SAM + 可切换修复模型") as dem
             sam_view = gr.Image(
                 label="标注区 · SAM 点选：在人像上单击",
                 type="pil",
+                format="jpeg",
                 height=480,
                 elem_id="interact-view",
             )
-            with gr.Accordion("可选：笔刷精修 Mask（左侧有笔刷工具栏的才是画板）", open=False):
+            with gr.Accordion("可选：笔刷精修 Mask（点选时不回传画板）", open=False):
+                load_brush_btn = gr.Button("载入当前 Mask 到笔刷")
                 editor = gr.ImageEditor(
                     label="笔刷精修（仅涂抹/橡皮；不能画矩形框）",
                     type="pil",
@@ -718,7 +750,7 @@ with gr.Blocks(title="全景人像消除 · SAM + 可切换修复模型") as dem
                 )
 
         with gr.Column(scale=1):
-            result = gr.Image(label="消除结果（原图像素）", type="pil", height=420)
+            result = gr.Image(label="消除结果（原图像素）", type="pil", format="jpeg", height=420)
             mask_preview = gr.Image(label="最终 Mask 预览", type="pil", height=200)
 
     _examples = list_resource_examples()
@@ -736,6 +768,15 @@ with gr.Blocks(title="全景人像消除 · SAM + 可切换修复模型") as dem
         rect_mask_state,
         sam_view,
         editor,
+        sam_mask_state,
+        status,
+    ]
+    click_outputs = [
+        points_state,
+        rects_state,
+        rect_pending_state,
+        rect_mask_state,
+        sam_view,
         sam_mask_state,
         status,
     ]
@@ -768,7 +809,12 @@ with gr.Blocks(title="全景人像消除 · SAM + 可切换修复模型") as dem
             sam_mask_state,
             rect_use_sam,
         ],
-        outputs=interact_outputs,
+        outputs=click_outputs,
+    )
+    load_brush_btn.click(
+        fn=sync_brush_editor,
+        inputs=[original, sam_mask_state],
+        outputs=[editor],
     )
     clear_btn.click(
         fn=clear_sam,
