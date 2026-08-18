@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import os
 import re
+import threading
+import uuid
+from collections import OrderedDict
 from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
@@ -30,8 +33,37 @@ MAX_INFER_SIDE = int(os.environ.get("MAX_INFER_SIDE", "1536"))
 POWERPAINT_MAX_SIDE = int(os.environ.get("POWERPAINT_MAX_SIDE", "768"))
 # SAM 编码用图最长边（越小越快；点坐标会映射回原图）
 SAM_MAX_SIDE = int(os.environ.get("SAM_MAX_SIDE", "1024"))
-PREVIEW_MAX_SIDE = 1600
+PREVIEW_MAX_SIDE = int(os.environ.get("PREVIEW_MAX_SIDE", "960"))
 DEFAULT_MODEL = os.environ.get("INPAINT_MODEL", "LaMa")
+
+# 原尺寸 Mask 只放服务端内存，浏览器只拿 session id + 缩略预览
+_MASK_LOCK = threading.Lock()
+_MASK_STORE: OrderedDict[str, dict] = OrderedDict()
+_MAX_MASK_SESSIONS = 32
+
+
+def _ensure_session_id(sid: str | None) -> str:
+    return sid if sid else uuid.uuid4().hex
+
+
+def _get_masks(sid: str | None) -> tuple[Image.Image | None, Image.Image | None]:
+    if not sid:
+        return None, None
+    with _MASK_LOCK:
+        slot = _MASK_STORE.get(sid) or {}
+        return slot.get("combined"), slot.get("rect")
+
+
+def _put_masks(sid: str, combined: Image.Image | None, rect: Image.Image | None) -> None:
+    with _MASK_LOCK:
+        while sid not in _MASK_STORE and len(_MASK_STORE) >= _MAX_MASK_SESSIONS:
+            _MASK_STORE.popitem(last=False)
+        _MASK_STORE[sid] = {"combined": combined, "rect": rect}
+        _MASK_STORE.move_to_end(sid)
+
+
+def _reset_masks(sid: str) -> None:
+    _put_masks(sid, None, None)
 
 
 def list_resource_examples() -> list[list[str]]:
@@ -369,14 +401,6 @@ def _union_masks(a: Image.Image | None, b: Image.Image | None, size: tuple[int, 
     return Image.fromarray(base, mode="L")
 
 
-def _as_mask_image(mask_img) -> Image.Image | None:
-    if mask_img is None:
-        return None
-    if isinstance(mask_img, Image.Image):
-        return mask_img.convert("L")
-    return Image.fromarray(np.array(mask_img)).convert("L")
-
-
 def _compose_editor(original: Image.Image, mask: Image.Image | None):
     if mask is None:
         preview = _preview_size(original).convert("RGBA")
@@ -390,30 +414,32 @@ def on_sam_click(
     point_mode,
     rects_state,
     rect_pending,
-    rect_mask_img,
+    session_id,
     evt: gr.SelectData,
 ):
-    """在原图预览上点击，追加点并立即跑 SAM。"""
+    """在原图预览上点击，追加点并立即跑 SAM。Mask 留在服务端。"""
     original = _to_pil_rgb(original_img)
     if original is None:
         raise gr.Error("请先上传全景原图")
 
+    sid = _ensure_session_id(session_id)
     ox, oy = _preview_to_original_xy(original, evt.index)
     label = 1 if point_mode == "正点（人像上）" else 0
 
     points = list(points_state or [])
     points.append((ox, oy, label))
     rects = list(rects_state or [])
-    rect_mask = _as_mask_image(rect_mask_img)
+    _, rect_mask = _get_masks(sid)
 
     points_mask = run_sam_on_points(original_img, original, points)
     mask = _union_masks(points_mask, rect_mask, original.size)
+    _put_masks(sid, mask, rect_mask)
     vis = overlay_mask_preview(original, mask, points, rects, rect_pending)
     status = (
         f"SAM 已更新：{len(points)} 个点（最近 {'正' if label == 1 else '负'}点 @ ({ox},{oy})）。"
         "可继续点击。笔刷画板不会每次回传，精修前请点「载入当前 Mask 到笔刷」。"
     )
-    return points, rects, rect_pending, rect_mask, vis, mask, status
+    return points, rects, rect_pending, vis, status, sid
 
 
 def on_rect_click(
@@ -421,8 +447,7 @@ def on_rect_click(
     points_state,
     rects_state,
     rect_pending,
-    rect_mask_img,
-    combined_mask_img,
+    session_id,
     rect_use_sam,
     evt: gr.SelectData,
 ):
@@ -431,24 +456,24 @@ def on_rect_click(
     if original is None:
         raise gr.Error("请先上传全景原图")
 
+    sid = _ensure_session_id(session_id)
     ox, oy = _preview_to_original_xy(original, evt.index)
     points = list(points_state or [])
     rects = list(rects_state or [])
     pending = rect_pending
-    rect_mask = _as_mask_image(rect_mask_img)
-    combined = _as_mask_image(combined_mask_img)
+    combined, rect_mask = _get_masks(sid)
 
     if pending is None:
         pending = (ox, oy)
         vis = overlay_mask_preview(original, combined, points, rects, pending)
         status = f"矩形起点已定 @ ({ox},{oy})，请再点对角终点完成框选。"
-        return points, rects, pending, rect_mask, vis, combined, status
+        return points, rects, pending, vis, status, sid
 
     x1, y1, x2, y2 = _normalize_rect(pending[0], pending[1], ox, oy)
     if x2 - x1 < 4 or y2 - y1 < 4:
         vis = overlay_mask_preview(original, combined, points, rects, pending)
         status = "矩形太小，请重新点击更大的对角区域。"
-        return points, rects, pending, rect_mask, vis, combined, status
+        return points, rects, pending, vis, status, sid
 
     rect = (x1, y1, x2, y2)
     rects.append(rect)
@@ -462,12 +487,12 @@ def on_rect_click(
         rect_mask = union_rect_mask(rect_mask, original.size, rect)
         how = "整框填色"
 
-    # 与已有 SAM 点选结果合并（若有）
     points_mask = run_sam_on_points(original_img, original, points) if points else None
     mask = _union_masks(points_mask, rect_mask, original.size)
+    _put_masks(sid, mask, rect_mask)
     vis = overlay_mask_preview(original, mask, points, rects, pending)
     status = f"已添加矩形 #{len(rects)} [{how}] ({x1},{y1})-({x2},{y2})。可继续画框。精修前请载入 Mask 到笔刷。"
-    return points, rects, pending, rect_mask, vis, mask, status
+    return points, rects, pending, vis, status, sid
 
 
 def on_interact_click(
@@ -477,8 +502,7 @@ def on_interact_click(
     interact_mode,
     rects_state,
     rect_pending,
-    rect_mask_img,
-    sam_mask_img,
+    session_id,
     rect_use_sam,
     evt: gr.SelectData,
 ):
@@ -488,41 +512,42 @@ def on_interact_click(
             points_state,
             rects_state,
             rect_pending,
-            rect_mask_img,
-            sam_mask_img,
+            session_id,
             rect_use_sam,
             evt,
         )
     return on_sam_click(
-        original_img, points_state, point_mode, rects_state, rect_pending, rect_mask_img, evt
+        original_img, points_state, point_mode, rects_state, rect_pending, session_id, evt
     )
 
 
-def sync_brush_editor(original_img, sam_mask_img):
+def sync_brush_editor(original_img, session_id):
     """仅在用户要笔刷精修时把 Mask 写入画板，避免每次点选回传 ImageEditor。"""
     original = _to_pil_rgb(original_img)
     if original is None:
         raise gr.Error("请先上传全景原图")
-    mask = _as_mask_image(sam_mask_img)
+    mask, _ = _get_masks(session_id)
     return _compose_editor(original, mask)
 
 
-def clear_sam(original_img):
+def clear_sam(original_img, session_id):
     global _SAM_EMBED_KEY
     _SAM_EMBED_KEY = None
+    sid = _ensure_session_id(session_id)
+    _reset_masks(sid)
     original = _to_pil_rgb(original_img)
     points: list = []
     rects: list = []
     pending = None
     if original is None:
-        return points, rects, pending, None, None, None, None, "已清空"
+        return points, rects, pending, None, None, "已清空", sid
     preview = _preview_size(original)
     editor = {
         "background": preview.convert("RGBA"),
         "layers": [],
         "composite": preview.convert("RGBA"),
     }
-    return points, rects, pending, None, preview, editor, None, "已清空 SAM 点、矩形框与 Mask，可重新标注"
+    return points, rects, pending, preview, editor, "已清空 SAM 点、矩形框与 Mask，可重新标注", sid
 
 
 def _model_controls(model: str):
@@ -554,7 +579,7 @@ def _model_controls(model: str):
 def remove_person(
     original_img,
     editor_value,
-    sam_mask_img,
+    session_id,
     dilate_px: int,
     max_side: int,
     model_name: str,
@@ -568,9 +593,8 @@ def remove_person(
 
     progress(0.15, desc="解析 Mask...")
     brush_mask = _extract_brush_mask(editor_value, original.size)
-    sam_mask = None
-    if sam_mask_img is not None:
-        sam_mask = sam_mask_img if isinstance(sam_mask_img, Image.Image) else Image.fromarray(np.array(sam_mask_img))
+    sam_mask, _ = _get_masks(session_id)
+    if sam_mask is not None:
         sam_mask = sam_mask.convert("L").resize(original.size, Image.Resampling.NEAREST)
 
     if brush_mask is not None and sam_mask is not None:
@@ -607,19 +631,21 @@ def remove_person(
     progress(1.0, desc="完成")
     return (
         result,
-        mask_bin.convert("RGB"),
+        _preview_size(mask_bin.convert("RGB")),
         f"{backend.name} 完成 {result.size[0]}×{result.size[1]}，已保存 {out_path.name}",
     )
 
 
-def load_original(img):
+def load_original(img, session_id):
     """上传原图后：刷新预览与空画板。"""
     global _SAM_EMBED_KEY
     _SAM_EMBED_KEY = None
+    sid = _ensure_session_id(session_id)
+    _reset_masks(sid)
     pil = _to_pil_rgb(img)
     stem = _image_stem(img)
     if pil is None:
-        return [], [], None, None, None, None, None, "请上传原图", "upload"
+        return [], [], None, None, None, "请上传原图", "upload", sid
     preview = _preview_size(pil)
     editor = {
         "background": preview.convert("RGBA"),
@@ -630,12 +656,11 @@ def load_original(img):
         [],
         [],
         None,
-        None,
         preview,
         editor,
-        None,
         f"已加载 {pil.size[0]}×{pil.size[1]}（{stem}）。可选「SAM 点选」或「矩形框」标注人像。",
         stem,
+        sid,
     )
 
 
@@ -674,15 +699,14 @@ with gr.Blocks(title="全景人像消除 · SAM + 可切换修复模型") as dem
            - **矩形框**：点两个**对角点**定框（会出现青色矩形）  
         3. 需要修边时再展开「笔刷精修」，点「载入当前 Mask 到笔刷」  
         4. 选修复模型后开始消除 → `output/原图名_模型_时间.jpg`  
-           Mask 共用，换模型不必重新点选。点选只传坐标，不回传画板。
+           Mask 留在服务端，点选只回传 960 预览。
         """
     )
 
     points_state = gr.State([])
     rects_state = gr.State([])
     rect_pending_state = gr.State(None)
-    rect_mask_state = gr.State(None)
-    sam_mask_state = gr.State(None)
+    session_id = gr.State("")
     source_stem_state = gr.State("upload")
 
     with gr.Row():
@@ -765,26 +789,23 @@ with gr.Blocks(title="全景人像消除 · SAM + 可切换修复模型") as dem
         points_state,
         rects_state,
         rect_pending_state,
-        rect_mask_state,
         sam_view,
         editor,
-        sam_mask_state,
         status,
     ]
     click_outputs = [
         points_state,
         rects_state,
         rect_pending_state,
-        rect_mask_state,
         sam_view,
-        sam_mask_state,
         status,
+        session_id,
     ]
 
     original.change(
         fn=load_original,
-        inputs=[original],
-        outputs=interact_outputs + [source_stem_state],
+        inputs=[original, session_id],
+        outputs=interact_outputs + [source_stem_state, session_id],
     )
     interact_mode.change(
         fn=on_mode_change,
@@ -805,25 +826,24 @@ with gr.Blocks(title="全景人像消除 · SAM + 可切换修复模型") as dem
             interact_mode,
             rects_state,
             rect_pending_state,
-            rect_mask_state,
-            sam_mask_state,
+            session_id,
             rect_use_sam,
         ],
         outputs=click_outputs,
     )
     load_brush_btn.click(
         fn=sync_brush_editor,
-        inputs=[original, sam_mask_state],
+        inputs=[original, session_id],
         outputs=[editor],
     )
     clear_btn.click(
         fn=clear_sam,
-        inputs=[original],
-        outputs=interact_outputs,
+        inputs=[original, session_id],
+        outputs=interact_outputs + [session_id],
     )
     run_btn.click(
         fn=remove_person,
-        inputs=[original, editor, sam_mask_state, dilate_px, max_side, model_name, source_stem_state],
+        inputs=[original, editor, session_id, dilate_px, max_side, model_name, source_stem_state],
         outputs=[result, mask_preview, status],
     )
 
