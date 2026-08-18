@@ -12,9 +12,17 @@ else
 fi
 
 echo "[deploy] 目录: $ROOT"
-$SUDO apt-get update -y
-$SUDO apt-get install -y python3-venv build-essential wget \
-  libglib2.0-0 libgl1-mesa-glx || $SUDO apt-get install -y libgl1
+if [[ "${SKIP_APT:-0}" != "1" ]]; then
+  if ! $SUDO apt-get update -y; then
+    echo "[deploy] apt-get update 失败（常见于无关的 NVIDIA container 源 404），忽略后继续"
+  fi
+  if ! $SUDO apt-get install -y python3-venv build-essential wget libglib2.0-0 libgl1-mesa-glx \
+    && ! $SUDO apt-get install -y python3-venv build-essential wget libglib2.0-0 libgl1; then
+    echo "[deploy] 系统包安装失败或已存在，若后面 conda/Python 可用则可忽略"
+  fi
+else
+  echo "[deploy] SKIP_APT=1，跳过 apt"
+fi
 
 pick_python312() {
   if [[ -n "${PYTHON_BIN:-}" && -x "${PYTHON_BIN}" ]]; then
@@ -25,7 +33,17 @@ pick_python312() {
     command -v python3.12
     return
   fi
-  local conda_sh=""
+  local conda_sh="" conda_base=""
+  if command -v conda >/dev/null 2>&1; then
+    conda_base="$(conda info --base 2>/dev/null || true)"
+    if [[ -n "$conda_base" && -f "$conda_base/etc/profile.d/conda.sh" ]]; then
+      # shellcheck disable=SC1090
+      source "$conda_base/etc/profile.d/conda.sh"
+      conda create -y -n pano-lama python=3.12 pip
+      conda run -n pano-lama python -c 'import sys; print(sys.executable)'
+      return
+    fi
+  fi
   for conda_sh in \
     /root/miniconda3/etc/profile.d/conda.sh \
     /root/anaconda3/etc/profile.d/conda.sh \
@@ -36,7 +54,7 @@ pick_python312() {
     if [[ -f "$conda_sh" ]]; then
       # shellcheck disable=SC1090
       source "$conda_sh"
-      conda create -y -n pano-lama python=3.12 pip >/dev/null
+      conda create -y -n pano-lama python=3.12 pip
       conda run -n pano-lama python -c 'import sys; print(sys.executable)'
       return
     fi
