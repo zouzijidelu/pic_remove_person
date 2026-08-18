@@ -1,8 +1,10 @@
-"""全景人像消除 Demo：人工笔刷 Mask + LaMa（保持原图分辨率）。"""
+"""全景人像消除 Demo：SAM 点选 / 矩形框粗 Mask + 笔刷精修 + 可切换修复模型。"""
 
 from __future__ import annotations
 
 import os
+import re
+from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
 
@@ -12,39 +14,110 @@ import numpy as np
 import torch
 from PIL import Image
 
+from backends import get_backend, list_backend_names
+
 ROOT = Path(__file__).resolve().parent
+RESOURCE_DIR = ROOT / "resource"
+RESOURCE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
 os.environ.setdefault("TORCH_HOME", str(ROOT / ".cache" / "torch"))
 OUTPUT_DIR = ROOT / "output"
 OUTPUT_DIR.mkdir(exist_ok=True)
+SAM_CKPT = ROOT / ".cache" / "sam" / "sam_vit_b_01ec64.pth"
+SAM_CKPT_URL = "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth"
 
-# 推理最长边上限（过大易被 macOS 因内存杀掉；1536 通常够用且远高于 Hama 720）
+# 推理最长边上限（过大易被 macOS 因内存杀掉）
 MAX_INFER_SIDE = int(os.environ.get("MAX_INFER_SIDE", "1536"))
+POWERPAINT_MAX_SIDE = int(os.environ.get("POWERPAINT_MAX_SIDE", "768"))
+# SAM 编码用图最长边（越小越快；点坐标会映射回原图）
+SAM_MAX_SIDE = int(os.environ.get("SAM_MAX_SIDE", "1024"))
+PREVIEW_MAX_SIDE = 1600
+DEFAULT_MODEL = os.environ.get("INPAINT_MODEL", "LaMa")
 
 
-def pick_device() -> torch.device:
-    # TorchScript LaMa 在 MPS 上常出块状/花屏伪影，默认强制 CPU 保证效果
-    force = os.environ.get("LAMA_DEVICE", "cpu").lower()
-    if force in {"cpu", "cuda", "mps"}:
-        if force == "cuda" and not torch.cuda.is_available():
-            return torch.device("cpu")
-        if force == "mps" and not torch.backends.mps.is_available():
-            return torch.device("cpu")
-        return torch.device(force)
+def list_resource_examples() -> list[list[str]]:
+    if not RESOURCE_DIR.is_dir():
+        return []
+    files = sorted(
+        p for p in RESOURCE_DIR.iterdir() if p.is_file() and p.suffix.lower() in RESOURCE_EXTS
+    )
+    return [[str(p)] for p in files]
+
+
+def _safe_stem(name: str) -> str:
+    stem = Path(str(name)).stem
+    stem = re.sub(r'[<>:"/\\|?*]+', "_", stem)
+    stem = re.sub(r"\s+", "_", stem).strip("._")
+    return (stem or "upload")[:80]
+
+
+def _image_stem(img) -> str:
+    """从上传/样例图尽量取出原文件名（不含扩展名）。"""
+    raw = None
+    if img is None:
+        return "upload"
+    if isinstance(img, Image.Image):
+        raw = getattr(img, "filename", None)
+    elif isinstance(img, (str, Path)):
+        raw = str(img)
+    elif isinstance(img, dict):
+        raw = img.get("path") or img.get("orig_name") or img.get("name")
+    if not raw:
+        return "upload"
+    return _safe_stem(raw)
+
+
+def _output_paths(source_stem: str, model_name: str) -> tuple[Path, Path]:
+    stem = _safe_stem(source_stem or "upload")
+    model = _safe_stem(model_name or "model")
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    prefix = f"{stem}_{model}_{ts}"
+    return OUTPUT_DIR / f"{prefix}.jpg", OUTPUT_DIR / f"{prefix}_mask.png"
+
+
+def pick_sam_device() -> torch.device:
+    # SAM 在 MPS 上通常可用；也可强制 LAMA_DEVICE / SAM_DEVICE
+    force = os.environ.get("SAM_DEVICE", os.environ.get("LAMA_DEVICE", "cpu")).lower()
+    if force == "mps" and torch.backends.mps.is_available():
+        return torch.device("mps")
+    if force == "cuda" and torch.cuda.is_available():
+        return torch.device("cuda")
     return torch.device("cpu")
 
 
-@lru_cache(maxsize=1)
-def get_lama():
-    from simple_lama_inpainting import SimpleLama
+def ensure_sam_checkpoint() -> Path:
+    SAM_CKPT.parent.mkdir(parents=True, exist_ok=True)
+    if SAM_CKPT.exists() and SAM_CKPT.stat().st_size > 300_000_000:
+        return SAM_CKPT
+    import urllib.request
 
-    device = pick_device()
-    print(f"[lama-demo] loading LaMa on {device} ...")
-    return SimpleLama(device=device)
+    print(f"[sam] downloading checkpoint → {SAM_CKPT}")
+    tmp = SAM_CKPT.with_suffix(".pth.partial")
+    urllib.request.urlretrieve(SAM_CKPT_URL, tmp)
+    tmp.replace(SAM_CKPT)
+    return SAM_CKPT
+
+
+@lru_cache(maxsize=1)
+def get_sam_predictor():
+    from segment_anything import SamPredictor, sam_model_registry
+
+    ckpt = ensure_sam_checkpoint()
+    device = pick_sam_device()
+    print(f"[sam] loading ViT-B on {device} ...")
+    sam = sam_model_registry["vit_b"](checkpoint=str(ckpt))
+    sam.to(device=device)
+    sam.eval()
+    return SamPredictor(sam)
 
 
 def _to_pil_rgb(img) -> Image.Image | None:
     if img is None:
         return None
+    if isinstance(img, (str, Path)):
+        p = Path(img)
+        if not p.exists():
+            return None
+        return Image.open(p).convert("RGB")
     if isinstance(img, Image.Image):
         return img.convert("RGB")
     arr = np.array(img)
@@ -53,6 +126,21 @@ def _to_pil_rgb(img) -> Image.Image | None:
     if arr.shape[-1] == 4:
         return Image.fromarray(arr, mode="RGBA").convert("RGB")
     return Image.fromarray(arr[..., :3].astype(np.uint8), mode="RGB")
+
+
+def _resize_max_side(pil: Image.Image, max_side: int) -> tuple[Image.Image, float]:
+    w, h = pil.size
+    long_side = max(w, h)
+    if long_side <= max_side:
+        return pil, 1.0
+    scale = max_side / float(long_side)
+    nw, nh = max(1, int(round(w * scale))), max(1, int(round(h * scale)))
+    return pil.resize((nw, nh), Image.Resampling.LANCZOS), scale
+
+
+def _preview_size(pil: Image.Image) -> Image.Image:
+    preview, _ = _resize_max_side(pil, PREVIEW_MAX_SIDE)
+    return preview
 
 
 def _extract_brush_mask(editor_value, target_size: tuple[int, int]) -> Image.Image | None:
@@ -73,10 +161,8 @@ def _extract_brush_mask(editor_value, target_size: tuple[int, int]) -> Image.Ima
                 continue
             layer_img = layer if isinstance(layer, Image.Image) else Image.fromarray(np.array(layer))
             layer_img = layer_img.convert("RGBA")
-            # 只认 alpha：避免把整层不透明底当成 mask
             alpha = np.array(layer_img.split()[-1])
             if alpha.max() == 0:
-                # 部分 Gradio 版本笔刷写在 RGB、alpha 全 255 或全 0
                 rgb = np.array(layer_img.convert("RGB"))
                 painted = (rgb.sum(axis=2) > 15).astype(np.uint8) * 255
             else:
@@ -107,63 +193,344 @@ def dilate_mask(mask: Image.Image, pixels: int) -> Image.Image:
     return Image.fromarray(arr, mode="L")
 
 
-def resize_for_infer(image: Image.Image, mask: Image.Image, max_side: int):
-    w, h = image.size
-    long_side = max(w, h)
-    if long_side <= max_side:
-        return image, mask, 1.0
-    scale = max_side / float(long_side)
-    nw, nh = max(1, int(round(w * scale))), max(1, int(round(h * scale)))
-    # 对齐到 8，减少 pad 浪费
-    nw = max(8, nw - nw % 8)
-    nh = max(8, nh - nh % 8)
-    image_s = image.resize((nw, nh), Image.Resampling.LANCZOS)
-    mask_s = mask.resize((nw, nh), Image.Resampling.NEAREST)
-    return image_s, mask_s, scale
+def mask_to_editor(background: Image.Image, mask: Image.Image, alpha: int = 150):
+    """把 Mask 画成红色半透明图层，放进 ImageEditor 供继续精修。"""
+    bg = _preview_size(background).convert("RGBA")
+    mw, mh = bg.size
+    m = np.array(mask.resize((mw, mh), Image.Resampling.NEAREST))
+    layer = np.zeros((mh, mw, 4), dtype=np.uint8)
+    hit = m > 127
+    layer[hit] = [255, 0, 0, int(alpha)]
+    layer_img = Image.fromarray(layer, mode="RGBA")
+    composite = Image.alpha_composite(bg, layer_img)
+    return {
+        "background": bg,
+        "layers": [layer_img],
+        "composite": composite,
+    }
 
 
-def run_lama(image: Image.Image, mask: Image.Image) -> Image.Image:
-    """在给定分辨率上跑 LaMa，并裁掉 pad，保证输出尺寸=输入。"""
-    from simple_lama_inpainting.utils.util import prepare_img_and_mask
+def overlay_mask_preview(
+    image: Image.Image,
+    mask: Image.Image | None,
+    points: list,
+    rects: list | None = None,
+    pending_corner: tuple[int, int] | None = None,
+) -> Image.Image:
+    """在预览图上叠 Mask + SAM 点 + 矩形框。"""
+    preview = _preview_size(image).convert("RGB")
+    arr = np.array(preview).astype(np.float32)
+    if mask is not None:
+        m = np.array(mask.resize(preview.size, Image.Resampling.NEAREST)) > 127
+        arr[m] = arr[m] * 0.45 + np.array([255, 60, 60], dtype=np.float32) * 0.55
+    out = np.clip(arr, 0, 255).astype(np.uint8)
+    draw_arr = out
+    ow, oh = image.size
+    pw, ph = preview.size
+    sx, sy = pw / float(ow), ph / float(oh)
 
-    lama = get_lama()
-    orig_w, orig_h = image.size
-    img_t, mask_t = prepare_img_and_mask(image, mask, lama.device, pad_out_to_modulo=8)
+    for x, y, label in points or []:
+        px, py = int(x * sx), int(y * sy)
+        color = (0, 220, 0) if label == 1 else (40, 40, 255)
+        cv2.circle(draw_arr, (px, py), 8, color, -1)
+        cv2.circle(draw_arr, (px, py), 10, (255, 255, 255), 2)
+
+    for x1, y1, x2, y2 in rects or []:
+        p1 = (int(x1 * sx), int(y1 * sy))
+        p2 = (int(x2 * sx), int(y2 * sy))
+        cv2.rectangle(draw_arr, p1, p2, (0, 255, 255), 3)
+
+    if pending_corner is not None:
+        px, py = int(pending_corner[0] * sx), int(pending_corner[1] * sy)
+        cv2.circle(draw_arr, (px, py), 14, (0, 255, 255), 3)
+        cv2.drawMarker(
+            draw_arr, (px, py), (0, 255, 255), markerType=cv2.MARKER_CROSS, markerSize=28, thickness=2
+        )
+        cv2.putText(
+            draw_arr,
+            "1",
+            (px + 16, py - 12),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (0, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+
+    return Image.fromarray(draw_arr, mode="RGB")
+
+
+def _preview_to_original_xy(original: Image.Image, evt_index) -> tuple[int, int]:
+    preview = _preview_size(original)
+    pw, ph = preview.size
+    ow, oh = original.size
+    cx, cy = evt_index
+    ox = int(np.clip(cx * ow / pw, 0, ow - 1))
+    oy = int(np.clip(cy * oh / ph, 0, oh - 1))
+    return ox, oy
+
+
+def _normalize_rect(x1: int, y1: int, x2: int, y2: int) -> tuple[int, int, int, int]:
+    return min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2)
+
+
+def union_rect_mask(mask: Image.Image | None, size: tuple[int, int], rect: tuple[int, int, int, int]) -> Image.Image:
+    """把矩形区域并入 Mask（原图坐标）。"""
+    w, h = size
+    if mask is None:
+        arr = np.zeros((h, w), dtype=np.uint8)
+    else:
+        arr = np.array(mask.convert("L").resize((w, h), Image.Resampling.NEAREST))
+    x1, y1, x2, y2 = rect
+    x1, y1 = max(0, x1), max(0, y1)
+    x2, y2 = min(w - 1, x2), min(h - 1, y2)
+    if x2 > x1 and y2 > y1:
+        arr[y1 : y2 + 1, x1 : x2 + 1] = 255
+    return Image.fromarray(arr, mode="L")
+
+
+def run_sam_on_points(original: Image.Image, points: list[tuple[int, int, int]]) -> Image.Image:
+    """points: [(x,y,label)] 原图像素坐标，label 1=正点 0=负点。"""
+    if not points:
+        raise gr.Error("请先在图上点击人像（可多点）")
+
+    predictor = get_sam_predictor()
+    sam_img, scale = _resize_max_side(original, SAM_MAX_SIDE)
+    rgb = np.array(sam_img.convert("RGB"))
+    predictor.set_image(rgb)
+
+    coords = np.array([[p[0] * scale, p[1] * scale] for p in points], dtype=np.float32)
+    labels = np.array([p[2] for p in points], dtype=np.int32)
 
     with torch.inference_mode():
-        inpainted = lama.model(img_t, mask_t)
-        out = inpainted[0].permute(1, 2, 0).detach().cpu().numpy()
-        out = np.clip(out * 255, 0, 255).astype(np.uint8)
+        masks, scores, _ = predictor.predict(
+            point_coords=coords,
+            point_labels=labels,
+            multimask_output=True,
+        )
+    best = masks[int(np.argmax(scores))]
+    mask_small = (best.astype(np.uint8) * 255)
+    mask_full = cv2.resize(mask_small, original.size, interpolation=cv2.INTER_NEAREST)
+    print(f"[sam] points={len(points)} best_score={float(scores.max()):.3f} mask_px={int(mask_full.sum()/255)}")
+    return Image.fromarray(mask_full, mode="L")
 
-    # 去掉 pad
-    out = out[:orig_h, :orig_w]
-    return Image.fromarray(out, mode="RGB")
+
+def run_sam_on_box(original: Image.Image, box_xyxy: tuple[int, int, int, int]) -> Image.Image:
+    """用 SAM box prompt 分割矩形内目标。"""
+    predictor = get_sam_predictor()
+    sam_img, scale = _resize_max_side(original, SAM_MAX_SIDE)
+    rgb = np.array(sam_img.convert("RGB"))
+    predictor.set_image(rgb)
+    x1, y1, x2, y2 = box_xyxy
+    box = np.array([x1 * scale, y1 * scale, x2 * scale, y2 * scale], dtype=np.float32)
+
+    with torch.inference_mode():
+        masks, scores, _ = predictor.predict(
+            point_coords=None,
+            point_labels=None,
+            box=box[None, :],
+            multimask_output=True,
+        )
+    best = masks[int(np.argmax(scores))]
+    mask_small = (best.astype(np.uint8) * 255)
+    mask_full = cv2.resize(mask_small, original.size, interpolation=cv2.INTER_NEAREST)
+    print(f"[sam] box={box_xyxy} best_score={float(scores.max()):.3f} mask_px={int(mask_full.sum()/255)}")
+    return Image.fromarray(mask_full, mode="L")
 
 
-def paste_back(original: Image.Image, inpainted_small: Image.Image, mask_full: Image.Image) -> Image.Image:
-    """若推理用了降采样，把结果放大后仅在 mask 区域贴回原图，避免整图变糊。"""
-    if inpainted_small.size == original.size:
-        return inpainted_small
+def _union_masks(a: Image.Image | None, b: Image.Image | None, size: tuple[int, int]) -> Image.Image | None:
+    if a is None and b is None:
+        return None
+    w, h = size
+    base = np.zeros((h, w), dtype=np.uint8)
+    for m in (a, b):
+        if m is None:
+            continue
+        arr = np.array(m.convert("L").resize((w, h), Image.Resampling.NEAREST))
+        base = np.maximum(base, arr)
+    return Image.fromarray(base, mode="L")
 
-    up = inpainted_small.resize(original.size, Image.Resampling.LANCZOS)
-    orig = np.array(original.convert("RGB"))
-    up_arr = np.array(up.convert("RGB"))
-    m = np.array(mask_full.resize(original.size, Image.Resampling.NEAREST))
-    # 软边缘混合，减轻贴回接缝
-    m_f = (m.astype(np.float32) / 255.0)[..., None]
-    # 轻微羽化
-    if m_f.max() > 0:
-        m_blur = cv2.GaussianBlur(m.astype(np.float32), (0, 0), sigmaX=2)
-        m_f = (m_blur / 255.0)[..., None]
-    blended = orig.astype(np.float32) * (1.0 - m_f) + up_arr.astype(np.float32) * m_f
-    return Image.fromarray(np.clip(blended, 0, 255).astype(np.uint8), mode="RGB")
+
+def _as_mask_image(mask_img) -> Image.Image | None:
+    if mask_img is None:
+        return None
+    if isinstance(mask_img, Image.Image):
+        return mask_img.convert("L")
+    return Image.fromarray(np.array(mask_img)).convert("L")
+
+
+def _compose_editor(original: Image.Image, mask: Image.Image | None):
+    if mask is None:
+        preview = _preview_size(original).convert("RGBA")
+        return {"background": preview, "layers": [], "composite": preview}
+    return mask_to_editor(original, mask)
+
+
+def on_sam_click(
+    original_img,
+    points_state,
+    point_mode,
+    rects_state,
+    rect_pending,
+    rect_mask_img,
+    evt: gr.SelectData,
+):
+    """在原图预览上点击，追加点并立即跑 SAM。"""
+    original = _to_pil_rgb(original_img)
+    if original is None:
+        raise gr.Error("请先上传全景原图")
+
+    ox, oy = _preview_to_original_xy(original, evt.index)
+    label = 1 if point_mode == "正点（人像上）" else 0
+
+    points = list(points_state or [])
+    points.append((ox, oy, label))
+    rects = list(rects_state or [])
+    rect_mask = _as_mask_image(rect_mask_img)
+
+    points_mask = run_sam_on_points(original, points)
+    mask = _union_masks(points_mask, rect_mask, original.size)
+    vis = overlay_mask_preview(original, mask, points, rects, rect_pending)
+    editor = _compose_editor(original, mask)
+    status = (
+        f"SAM 已更新：{len(points)} 个点（最近 {'正' if label == 1 else '负'}点 @ ({ox},{oy})）。"
+        "可继续点击，或切换「矩形框」，或到画板笔刷精修。"
+    )
+    return points, rects, rect_pending, rect_mask, vis, editor, mask, status
+
+
+def on_rect_click(
+    original_img,
+    points_state,
+    rects_state,
+    rect_pending,
+    rect_mask_img,
+    combined_mask_img,
+    rect_use_sam,
+    evt: gr.SelectData,
+):
+    """对角两点定矩形框：第 1 点定点，第 2 点成框并写入 Mask。"""
+    original = _to_pil_rgb(original_img)
+    if original is None:
+        raise gr.Error("请先上传全景原图")
+
+    ox, oy = _preview_to_original_xy(original, evt.index)
+    points = list(points_state or [])
+    rects = list(rects_state or [])
+    pending = rect_pending
+    rect_mask = _as_mask_image(rect_mask_img)
+    combined = _as_mask_image(combined_mask_img)
+
+    if pending is None:
+        pending = (ox, oy)
+        vis = overlay_mask_preview(original, combined, points, rects, pending)
+        status = f"矩形起点已定 @ ({ox},{oy})，请再点对角终点完成框选。"
+        return points, rects, pending, rect_mask, vis, _compose_editor(original, combined), combined, status
+
+    x1, y1, x2, y2 = _normalize_rect(pending[0], pending[1], ox, oy)
+    if x2 - x1 < 4 or y2 - y1 < 4:
+        vis = overlay_mask_preview(original, combined, points, rects, pending)
+        status = "矩形太小，请重新点击更大的对角区域。"
+        return points, rects, pending, rect_mask, vis, _compose_editor(original, combined), combined, status
+
+    rect = (x1, y1, x2, y2)
+    rects.append(rect)
+    pending = None
+
+    if rect_use_sam:
+        box_mask = run_sam_on_box(original, rect)
+        rect_mask = _union_masks(rect_mask, box_mask, original.size)
+        how = "SAM 框内分割"
+    else:
+        rect_mask = union_rect_mask(rect_mask, original.size, rect)
+        how = "整框填色"
+
+    # 与已有 SAM 点选结果合并（若有）
+    points_mask = run_sam_on_points(original, points) if points else None
+    mask = _union_masks(points_mask, rect_mask, original.size)
+    vis = overlay_mask_preview(original, mask, points, rects, pending)
+    status = f"已添加矩形 #{len(rects)} [{how}] ({x1},{y1})-({x2},{y2})。可继续画框，或到画板笔刷精修。"
+    return points, rects, pending, rect_mask, vis, _compose_editor(original, mask), mask, status
+
+
+def on_interact_click(
+    original_img,
+    points_state,
+    point_mode,
+    interact_mode,
+    rects_state,
+    rect_pending,
+    rect_mask_img,
+    sam_mask_img,
+    rect_use_sam,
+    evt: gr.SelectData,
+):
+    if interact_mode == "矩形框":
+        return on_rect_click(
+            original_img,
+            points_state,
+            rects_state,
+            rect_pending,
+            rect_mask_img,
+            sam_mask_img,
+            rect_use_sam,
+            evt,
+        )
+    return on_sam_click(
+        original_img, points_state, point_mode, rects_state, rect_pending, rect_mask_img, evt
+    )
+
+
+def clear_sam(original_img):
+    original = _to_pil_rgb(original_img)
+    points: list = []
+    rects: list = []
+    pending = None
+    if original is None:
+        return points, rects, pending, None, None, None, None, "已清空"
+    preview = _preview_size(original)
+    editor = {
+        "background": preview.convert("RGBA"),
+        "layers": [],
+        "composite": preview.convert("RGBA"),
+    }
+    return points, rects, pending, None, preview, editor, None, "已清空 SAM 点、矩形框与 Mask，可重新标注"
+
+
+def _model_controls(model: str):
+    if model == "PowerPaint":
+        return (
+            gr.update(
+                minimum=512,
+                maximum=1280,
+                value=POWERPAINT_MAX_SIDE,
+                step=128,
+                label="PowerPaint ROI 最长边",
+                info="本机 16GB 建议 768；更大更清晰也更吃内存",
+            ),
+            "PowerPaint：按 Mask 裁 ROI 后推理。首次加载约 1～2 分钟，之后每次约 20～60 秒。需已安装旁路 iopaint-bench。",
+        )
+    return (
+        gr.update(
+            minimum=1024,
+            maximum=2560,
+            value=MAX_INFER_SIDE,
+            step=256,
+            label="推理最长边",
+            info="Mac 建议 1536；内存充足可试 2048",
+        ),
+        "LaMa：整图降采样推理，速度快，适合日常。换模型不必重新点选。",
+    )
 
 
 def remove_person(
     original_img,
     editor_value,
+    sam_mask_img,
     dilate_px: int,
     max_side: int,
+    model_name: str,
+    source_stem: str,
     progress=gr.Progress(),
 ):
     progress(0.05, desc="读取原图...")
@@ -171,81 +538,153 @@ def remove_person(
     if original is None:
         raise gr.Error("请先上传全景原图（左侧「原图」）")
 
-    progress(0.15, desc="解析笔刷 Mask...")
-    mask = _extract_brush_mask(editor_value, original.size)
-    if mask is None:
-        raise gr.Error("请在中间画板用笔刷涂抹要消除的人像（含脚下阴影更佳）")
+    progress(0.15, desc="解析 Mask...")
+    brush_mask = _extract_brush_mask(editor_value, original.size)
+    sam_mask = None
+    if sam_mask_img is not None:
+        sam_mask = sam_mask_img if isinstance(sam_mask_img, Image.Image) else Image.fromarray(np.array(sam_mask_img))
+        sam_mask = sam_mask.convert("L").resize(original.size, Image.Resampling.NEAREST)
+
+    if brush_mask is not None and sam_mask is not None:
+        # 画板精修优先：有笔刷层则用笔刷（已含 SAM/矩形写入的红层）
+        mask = brush_mask
+    elif brush_mask is not None:
+        mask = brush_mask
+    elif sam_mask is not None and np.array(sam_mask).max() > 0:
+        mask = sam_mask
+    else:
+        raise gr.Error("请先用 SAM 点选 / 矩形框标注，或在画板笔刷涂抹")
 
     mask = dilate_mask(mask, int(dilate_px))
     mask_bin = mask.point(lambda p: 255 if p > 127 else 0)
 
-    progress(0.3, desc=f"准备推理（最长边≤{int(max_side)}）...")
-    infer_img, infer_mask, scale = resize_for_infer(original, mask_bin, int(max_side))
-    print(f"[lama-demo] original={original.size} infer={infer_img.size} scale={scale:.3f} device={pick_device()}")
+    backend = get_backend(model_name)
+    progress(0.3, desc=f"{backend.name} 准备中（最长边≤{int(max_side)}）...")
+    print(f"[inpaint] model={backend.name} original={original.size} max_side={int(max_side)}")
 
-    progress(0.45, desc="LaMa 消除中...")
-    inpainted = run_lama(infer_img, infer_mask)
+    progress(0.45, desc=f"{backend.name} 消除中...")
+    try:
+        result = backend.inpaint(original, mask_bin, int(max_side))
+    except FileNotFoundError as e:
+        raise gr.Error(str(e)) from e
+    except Exception as e:
+        raise gr.Error(f"{backend.name} 失败：{e}") from e
 
-    progress(0.85, desc="贴回原图分辨率...")
-    result = paste_back(original, inpainted, mask_bin)
-
-    out_path = OUTPUT_DIR / "last_result.jpg"
+    stem = source_stem if source_stem and source_stem != "upload" else _image_stem(original_img)
+    out_path, mask_path = _output_paths(stem, backend.name)
     result.save(out_path, quality=95)
-    mask_bin.save(OUTPUT_DIR / "last_mask.png")
-    print(f"[lama-demo] saved {out_path} size={result.size}")
+    mask_bin.save(mask_path)
+    print(f"[inpaint] saved {out_path.name} mask={mask_path.name} size={result.size} model={backend.name}")
 
     progress(1.0, desc="完成")
-    # mask 预览缩略
-    mask_preview = mask_bin.convert("RGB")
-    return result, mask_preview, f"输出 {result.size[0]}×{result.size[1]}，已保存到 output/last_result.jpg"
+    return (
+        result,
+        mask_bin.convert("RGB"),
+        f"{backend.name} 完成 {result.size[0]}×{result.size[1]}，已保存 {out_path.name}",
+    )
 
 
-def load_to_editor(img):
-    """上传原图后，同步到画板供涂抹（画板仅作标注，不作为最终分辨率来源）。"""
+def load_original(img):
+    """上传原图后：刷新预览与空画板。"""
     pil = _to_pil_rgb(img)
+    stem = _image_stem(img)
     if pil is None:
-        return None
-    # 画板用稍小预览即可，加快涂抹；真正推理用左侧原图
-    w, h = pil.size
-    max_preview = 1600
-    if max(w, h) > max_preview:
-        s = max_preview / max(w, h)
-        pil = pil.resize((max(1, int(w * s)), max(1, int(h * s))), Image.Resampling.LANCZOS)
-    return {
-        "background": pil.convert("RGBA"),
+        return [], [], None, None, None, None, None, "请上传原图", "upload"
+    preview = _preview_size(pil)
+    editor = {
+        "background": preview.convert("RGBA"),
         "layers": [],
-        "composite": pil.convert("RGBA"),
+        "composite": preview.convert("RGBA"),
     }
+    return (
+        [],
+        [],
+        None,
+        None,
+        preview,
+        editor,
+        None,
+        f"已加载 {pil.size[0]}×{pil.size[1]}（{stem}）。可选「SAM 点选」或「矩形框」标注人像。",
+        stem,
+    )
+
+
+def on_mode_change(interact_mode):
+    if interact_mode == "矩形框":
+        tip = "【矩形框】请在下方蓝色标题的「标注区」上操作：先点一个角，再点对角 → 出现青色框。不要用笔刷画板（那是涂红点用的）。"
+        return (
+            gr.update(visible=False),
+            gr.update(visible=True),
+            gr.update(label="标注区 · 矩形框：点角1 → 再点对角2（可多框）"),
+            tip,
+        )
+    tip = "【SAM 点选】请在下方「标注区」人像上单击（可多点）。笔刷画板仅用于事后精修。"
+    return (
+        gr.update(visible=True),
+        gr.update(visible=False),
+        gr.update(label="标注区 · SAM 点选：在人像上单击"),
+        tip,
+    )
 
 
 CUSTOM_CSS = """
-.gradio-container { max-width: 1400px !important; }
+.gradio-container { max-width: 1500px !important; }
 footer { display: none !important; }
+#interact-view label span { color: #0b5fff !important; font-weight: 700 !important; }
 """
 
-with gr.Blocks(title="全景人像消除 · LaMa") as demo:
+with gr.Blocks(title="全景人像消除 · SAM + 可切换修复模型") as demo:
     gr.Markdown(
         """
-        # 全景人像消除（人工 Mask + LaMa）
-
-        **重要**：最终分辨率以左侧「原图」为准，不再被画板压缩（避免马赛克）。
+        # 全景人像消除（SAM 点选 / 矩形框 + 笔刷精修 + 可切换修复模型）
 
         1. 上传全景原图  
-        2. 在画板用笔刷涂抹人像（含阴影）  
-        3. 点击开始消除 → 结果保存到 `output/last_result.jpg`
-
-        设备默认 **CPU**（避免 Apple MPS 块状花屏）。可用环境变量 `LAMA_DEVICE=mps` 尝试加速。
+        2. 选标注模式后，在中间 **标注区**（蓝色标题那张图）上操作——**不是**下面带笔刷工具栏的画板  
+           - **SAM 点选**：单击人像  
+           - **矩形框**：点两个**对角点**定框（会出现青色矩形）  
+        3. 需要修边时再展开「笔刷精修」  
+        4. 选修复模型后开始消除 → `output/原图名_模型_时间.jpg`  
+           Mask 共用，换模型不必重新点选。
         """
     )
+
+    points_state = gr.State([])
+    rects_state = gr.State([])
+    rect_pending_state = gr.State(None)
+    rect_mask_state = gr.State(None)
+    sam_mask_state = gr.State(None)
+    source_stem_state = gr.State("upload")
 
     with gr.Row():
         with gr.Column(scale=1):
             original = gr.Image(
                 label="原图（保持分辨率）",
-                type="pil",
+                type="filepath",
                 image_mode="RGB",
-                height=280,
+                height=220,
             )
+            interact_mode = gr.Radio(
+                ["SAM 点选", "矩形框"],
+                value="SAM 点选",
+                label="标注模式",
+            )
+            point_mode = gr.Radio(
+                ["正点（人像上）", "负点（排除背景）"],
+                value="正点（人像上）",
+                label="SAM 点击模式",
+            )
+            rect_use_sam = gr.Checkbox(
+                value=False,
+                label="矩形框内用 SAM 分割（更贴合人像；关闭则整框消除）",
+                visible=False,
+            )
+            clear_btn = gr.Button("清空标注 / Mask")
+            model_name = gr.Radio(
+                choices=list_backend_names(),
+                value=DEFAULT_MODEL if DEFAULT_MODEL in list_backend_names() else "LaMa",
+                label="修复模型",
+            )
+            model_tip = gr.Markdown("LaMa：整图降采样推理，速度快，适合日常。换模型不必重新点选。")
             dilate_px = gr.Slider(0, 30, value=6, step=1, label="Mask 膨胀（像素）")
             max_side = gr.Slider(
                 1024,
@@ -253,50 +692,109 @@ with gr.Blocks(title="全景人像消除 · LaMa") as demo:
                 value=MAX_INFER_SIDE,
                 step=256,
                 label="推理最长边",
-                info="越大越清晰，但越占内存。Mac 建议 1536；内存充足可试 2048",
+                info="Mac 建议 1536；内存充足可试 2048",
             )
             run_btn = gr.Button("开始消除", variant="primary")
             status = gr.Textbox(label="状态", interactive=False)
 
         with gr.Column(scale=1):
-            editor = gr.ImageEditor(
-                label="在此涂抹人像（仅用于画 Mask）",
+            gr.Markdown("### 在此图上标注（点选 / 画框）")
+            sam_view = gr.Image(
+                label="标注区 · SAM 点选：在人像上单击",
                 type="pil",
-                image_mode="RGBA",
-                brush=gr.Brush(default_size=28, colors=["#ff0000"], color_mode="fixed"),
-                eraser=gr.Eraser(default_size=28),
-                layers=True,
-                fixed_canvas=False,
-                height=420,
+                height=480,
+                elem_id="interact-view",
             )
+            with gr.Accordion("可选：笔刷精修 Mask（左侧有笔刷工具栏的才是画板）", open=False):
+                editor = gr.ImageEditor(
+                    label="笔刷精修（仅涂抹/橡皮；不能画矩形框）",
+                    type="pil",
+                    image_mode="RGBA",
+                    brush=gr.Brush(default_size=28, colors=["#ff0000"], color_mode="fixed"),
+                    eraser=gr.Eraser(default_size=28),
+                    layers=True,
+                    fixed_canvas=False,
+                    height=280,
+                )
 
         with gr.Column(scale=1):
             result = gr.Image(label="消除结果（原图像素）", type="pil", height=420)
-            mask_preview = gr.Image(label="Mask 预览", type="pil", height=200)
+            mask_preview = gr.Image(label="最终 Mask 预览", type="pil", height=200)
 
-    gr.Examples(
-        examples=[
-            ["resource/44290365location_07.jpg"],
-            ["resource/505018258location_10.jpg"],
-            ["resource/826163191location_04.jpg"],
-        ],
+    _examples = list_resource_examples()
+    if _examples:
+        gr.Examples(
+            examples=_examples,
+            inputs=[original],
+            label=f"样例全景（resource/，共 {len(_examples)} 张）",
+        )
+
+    interact_outputs = [
+        points_state,
+        rects_state,
+        rect_pending_state,
+        rect_mask_state,
+        sam_view,
+        editor,
+        sam_mask_state,
+        status,
+    ]
+
+    original.change(
+        fn=load_original,
         inputs=[original],
-        label="样例全景",
+        outputs=interact_outputs + [source_stem_state],
     )
-
-    original.change(fn=load_to_editor, inputs=[original], outputs=[editor])
+    interact_mode.change(
+        fn=on_mode_change,
+        inputs=[interact_mode],
+        outputs=[point_mode, rect_use_sam, sam_view, status],
+    )
+    model_name.change(
+        fn=_model_controls,
+        inputs=[model_name],
+        outputs=[max_side, model_tip],
+    )
+    sam_view.select(
+        fn=on_interact_click,
+        inputs=[
+            original,
+            points_state,
+            point_mode,
+            interact_mode,
+            rects_state,
+            rect_pending_state,
+            rect_mask_state,
+            sam_mask_state,
+            rect_use_sam,
+        ],
+        outputs=interact_outputs,
+    )
+    clear_btn.click(
+        fn=clear_sam,
+        inputs=[original],
+        outputs=interact_outputs,
+    )
     run_btn.click(
         fn=remove_person,
-        inputs=[original, editor, dilate_px, max_side],
+        inputs=[original, editor, sam_mask_state, dilate_px, max_side, model_name, source_stem_state],
         outputs=[result, mask_preview, status],
     )
 
 
 if __name__ == "__main__":
+    host = os.environ.get("HOST", "127.0.0.1")
+    inbrowser = os.environ.get("INBROWSER", "1" if host in {"127.0.0.1", "localhost"} else "0") == "1"
+    auth = None
+    auth_raw = os.environ.get("GRADIO_AUTH", "").strip()
+    if auth_raw and ":" in auth_raw:
+        user, password = auth_raw.split(":", 1)
+        auth = (user, password)
     demo.queue(max_size=2).launch(
-        server_name="127.0.0.1",
+        server_name=host,
         server_port=int(os.environ.get("PORT", "7860")),
-        inbrowser=True,
+        inbrowser=inbrowser,
+        auth=auth,
         show_error=True,
         theme=gr.themes.Soft(),
         css=CUSTOM_CSS,

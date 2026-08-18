@@ -3,3 +3,4 @@ torchvision
 gradio
 simple-lama-inpainting
 opencv-python-headless
+segment-anything
