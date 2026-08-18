@@ -25,10 +25,19 @@ def bench_root() -> Path:
 
 
 def pick_device() -> str:
-    force = os.environ.get("POWERPAINT_DEVICE", "mps").lower()
+    force = os.environ.get("POWERPAINT_DEVICE", "auto").strip().lower()
     if force in {"cpu", "cuda", "mps"}:
         return force
-    return "mps"
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            return "cuda"
+        if torch.backends.mps.is_available():
+            return "mps"
+    except Exception:
+        pass
+    return "cpu"
 
 
 def _python() -> Path:
