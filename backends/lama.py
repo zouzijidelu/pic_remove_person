@@ -56,3 +56,6 @@ class LamaBackend:
         print(f"[lama] original={image.size} infer={infer_img.size} scale={scale:.3f} device={pick_device()}")
         inpainted = run_lama(infer_img, infer_mask)
         return paste_back(image, inpainted, mask)
+
+    def warmup(self) -> None:
+        get_lama()

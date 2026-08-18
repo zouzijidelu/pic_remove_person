@@ -189,3 +189,7 @@ class PowerPaintBackend:
                 self.close()
                 raise
         return paste_roi(image, roi_out, bbox, mask)
+
+    def warmup(self) -> None:
+        with self._lock:
+            self._ensure_worker()

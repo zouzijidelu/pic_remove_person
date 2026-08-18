@@ -849,6 +849,26 @@ with gr.Blocks(title="全景人像消除 · SAM + 可切换修复模型") as dem
 
 
 if __name__ == "__main__":
+    def warmup_models() -> None:
+        print("[warmup] SAM ...")
+        try:
+            get_sam_predictor()
+        except Exception as e:
+            print(f"[warmup] SAM 失败: {e}")
+        for name in list_backend_names():
+            print(f"[warmup] {name} ...")
+            backend = get_backend(name)
+            warmup = getattr(backend, "warmup", None)
+            if not callable(warmup):
+                continue
+            try:
+                warmup()
+            except Exception as e:
+                print(f"[warmup] {name} 失败（服务仍启动，首次使用该模型时会再试）: {e}")
+        print("[warmup] 完成，开始接受请求")
+
+    if os.environ.get("WARMUP", "1") != "0":
+        warmup_models()
     host = os.environ.get("HOST", "127.0.0.1")
     inbrowser = os.environ.get("INBROWSER", "1" if host in {"127.0.0.1", "localhost"} else "0") == "1"
     auth = None
