@@ -4,14 +4,19 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT"
 
+if [[ -n "${PYTHON_BIN:-}" && ! -x "${PYTHON_BIN}" ]]; then
+  PYTHON_BIN="$(printf '%s\n' "$PYTHON_BIN" | tail -n1)"
+fi
 if [[ -n "${PYTHON_BIN:-}" && -x "${PYTHON_BIN}" ]]; then
   :
 elif [[ -x /opt/homebrew/bin/python3.12 ]]; then
   PYTHON_BIN="/opt/homebrew/bin/python3.12"
+elif [[ -x /root/anaconda3/envs/pano-lama/bin/python ]]; then
+  PYTHON_BIN="/root/anaconda3/envs/pano-lama/bin/python"
 else
   PYTHON_BIN="$(command -v python3.12 || true)"
 fi
-if [[ -z "${PYTHON_BIN}" ]]; then
+if [[ -z "${PYTHON_BIN}" || ! -x "${PYTHON_BIN}" ]]; then
   echo "需要 Python 3.12（Ubuntu 20.04 可用 conda create -n pano-lama python=3.12，再 PYTHON_BIN=... ./setup.sh）"
   exit 1
 fi

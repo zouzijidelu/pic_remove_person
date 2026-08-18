@@ -24,9 +24,17 @@ else
   echo "[deploy] SKIP_APT=1，跳过 apt"
 fi
 
+conda_python312() {
+  # 日志走 stderr，stdout 只输出解释器路径，避免污染 PYTHON_BIN
+  if ! conda env list 2>/dev/null | awk '{print $1}' | grep -qx 'pano-lama'; then
+    conda create -y -n pano-lama python=3.12 pip >&2
+  fi
+  conda run -n pano-lama python -c 'import sys; print(sys.executable)'
+}
+
 pick_python312() {
   if [[ -n "${PYTHON_BIN:-}" && -x "${PYTHON_BIN}" ]]; then
-    echo "$PYTHON_BIN"
+    printf '%s\n' "$PYTHON_BIN"
     return
   fi
   if command -v python3.12 >/dev/null 2>&1; then
@@ -39,8 +47,7 @@ pick_python312() {
     if [[ -n "$conda_base" && -f "$conda_base/etc/profile.d/conda.sh" ]]; then
       # shellcheck disable=SC1090
       source "$conda_base/etc/profile.d/conda.sh"
-      conda create -y -n pano-lama python=3.12 pip
-      conda run -n pano-lama python -c 'import sys; print(sys.executable)'
+      conda_python312
       return
     fi
   fi
@@ -54,8 +61,7 @@ pick_python312() {
     if [[ -f "$conda_sh" ]]; then
       # shellcheck disable=SC1090
       source "$conda_sh"
-      conda create -y -n pano-lama python=3.12 pip
-      conda run -n pano-lama python -c 'import sys; print(sys.executable)'
+      conda_python312
       return
     fi
   done
