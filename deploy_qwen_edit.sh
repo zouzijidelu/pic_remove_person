@@ -78,6 +78,7 @@ set_kv QWEN_EDIT_MARGIN 256
 set_kv QWEN_EDIT_BENCH "$BENCH"
 set_kv QWEN_EDIT_DRY_RUN 0
 set_kv WARMUP_QWEN 0
+set_kv WARMUP_POWERPAINT 0
 
 echo "[qwen] 已写入 $ENVF"
 echo "[qwen] 第一次点 Qwen-Edit 会下载量化权重（约 15GB+），请确认磁盘充足。"

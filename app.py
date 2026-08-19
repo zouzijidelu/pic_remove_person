@@ -868,9 +868,18 @@ if __name__ == "__main__":
             get_sam_predictor()
         except Exception as e:
             print(f"[warmup] SAM 失败: {e}")
-        for name in list_backend_names():
+        names = list_backend_names()
+        both_heavy = "PowerPaint" in names and "Qwen-Edit" in names
+        for name in names:
             if name == "Qwen-Edit" and os.environ.get("WARMUP_QWEN", "0") != "1":
                 print("[warmup] Qwen-Edit 跳过（WARMUP_QWEN!=1，首次使用时再加载）")
+                continue
+            if (
+                name == "PowerPaint"
+                and both_heavy
+                and os.environ.get("WARMUP_POWERPAINT", "0") != "1"
+            ):
+                print("[warmup] PowerPaint 跳过（与 Qwen 共存时不预热，首次使用再加载；点 Qwen 也会卸掉 PowerPaint）")
                 continue
             print(f"[warmup] {name} ...")
             backend = get_backend(name)
