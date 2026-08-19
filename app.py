@@ -31,6 +31,7 @@ SAM_CKPT_URL = "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64
 # 推理最长边上限（过大易被 macOS 因内存杀掉）
 MAX_INFER_SIDE = int(os.environ.get("MAX_INFER_SIDE", "1536"))
 POWERPAINT_MAX_SIDE = int(os.environ.get("POWERPAINT_MAX_SIDE", "768"))
+QWEN_EDIT_MAX_SIDE = int(os.environ.get("QWEN_EDIT_MAX_SIDE", "768"))
 # SAM 编码用图最长边（越小越快；点坐标会映射回原图）
 SAM_MAX_SIDE = int(os.environ.get("SAM_MAX_SIDE", "1024"))
 PREVIEW_MAX_SIDE = int(os.environ.get("PREVIEW_MAX_SIDE", "960"))
@@ -563,6 +564,18 @@ def _model_controls(model: str):
             ),
             "PowerPaint：按 Mask 裁 ROI 后推理。首次加载约 1～2 分钟，之后每次约 20～60 秒。需已安装旁路 iopaint-bench。",
         )
+    if model == "Qwen-Edit":
+        return (
+            gr.update(
+                minimum=512,
+                maximum=1024,
+                value=QWEN_EDIT_MAX_SIDE,
+                step=128,
+                label="Qwen-Edit ROI 最长边",
+                info="3090 建议 768；禁止送整幅全景。与 PowerPaint 互斥占显存。",
+            ),
+            "Qwen-Edit：按 Mask 裁 ROI 后用指令编辑补背景。首次加载量化权重较慢；默认不随服务预热。",
+        )
     return (
         gr.update(
             minimum=1024,
@@ -856,6 +869,9 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"[warmup] SAM 失败: {e}")
         for name in list_backend_names():
+            if name == "Qwen-Edit" and os.environ.get("WARMUP_QWEN", "0") != "1":
+                print("[warmup] Qwen-Edit 跳过（WARMUP_QWEN!=1，首次使用时再加载）")
+                continue
             print(f"[warmup] {name} ...")
             backend = get_backend(name)
             warmup = getattr(backend, "warmup", None)

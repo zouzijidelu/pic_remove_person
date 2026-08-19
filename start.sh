@@ -33,8 +33,16 @@ export HOST PORT
 echo "启动全景人像消除 Demo → http://${HOST}:${PORT}"
 echo "浏览器打开上述地址：上传全景 → 点选人像 → 选修复模型 → 开始消除"
 if [[ "${ENABLE_POWERPAINT:-auto}" == "0" ]]; then
-  echo "本次仅启用 LaMa（ENABLE_POWERPAINT=0）"
+  echo "PowerPaint 未启用（ENABLE_POWERPAINT=0）"
 else
   echo "PowerPaint 走旁路 iopaint-bench（需已 ./setup.sh）；设备可用 POWERPAINT_DEVICE"
+fi
+if [[ "${ENABLE_QWEN_EDIT:-auto}" == "0" ]]; then
+  echo "Qwen-Edit 未启用（ENABLE_QWEN_EDIT=0）"
+else
+  echo "Qwen-Edit 走旁路 qwen-edit-bench；设备可用 QWEN_EDIT_DEVICE；默认不预热（WARMUP_QWEN=0）"
+  if [[ "${QWEN_EDIT_DRY_RUN:-0}" == "1" ]]; then
+    echo "Qwen-Edit 为 dry-run，不加载权重"
+  fi
 fi
 exec "$PYTHON" -u app.py

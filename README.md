@@ -6,7 +6,7 @@
 
 - **SAM 半自动**：在预览图上点击人像（可多点；支持负点排除背景），自动生成粗 Mask
 - **笔刷精修**：SAM 结果写入画板，可用笔刷/橡皮继续修边
-- **模型切换**：同一份 Mask，界面上切换 LaMa / PowerPaint，不必重新点选
+- **模型切换**：同一份 Mask，界面上切换 LaMa / PowerPaint / Qwen-Edit，不必重新点选
 - **保持原图分辨率**：推理可降采样或只跑 ROI，结果仅在 Mask 区域贴回原图
 - **Mask 膨胀 / 推理边长可调**
 - **样例图**：内置 `resource/` 全景样例
@@ -19,6 +19,7 @@
 | segment-anything | SAM ViT-B 点选分割 |
 | simple-lama-inpainting | LaMa 图像修复（本进程） |
 | IOPaint 1.6.0（旁路 `iopaint-bench`） | PowerPaint 图像修复（独立进程） |
+| 旁路 `qwen-edit-bench` | Qwen-Image-Edit-2511（独立进程，默认 NF4） |
 | PyTorch / OpenCV / Pillow | 推理与图像处理 |
 
 ## 项目结构
@@ -26,7 +27,7 @@
 ```
 消除人像/
 ├── app.py              # Gradio Demo 主程序
-├── backends/           # 修复模型插件（LaMa / PowerPaint）
+├── backends/           # 修复模型插件（LaMa / PowerPaint / Qwen-Edit）
 ├── setup.sh            # 创建虚拟环境并安装依赖
 ├── start.sh            # 启动服务
 ├── requirements.txt    # Python 依赖列表（不含 IOPaint）
@@ -55,7 +56,7 @@
 1. 上传全景原图（或点选样例）
 2. 在「标注区」点人像 → 自动出红色粗 Mask（可继续加点或切换负点 / 矩形框）
 3. 可选：在画板笔刷精修
-4. 选修复模型（LaMa 或 PowerPaint），调节「Mask 膨胀」「推理最长边」后点「开始消除」
+4. 选修复模型（LaMa / PowerPaint / Qwen-Edit），调节「Mask 膨胀」「推理最长边」后点「开始消除」
 5. 结果：`output/原图名_模型_时间.jpg`（Mask 为同名 `_mask.png`）
 
 首次运行会下载：
@@ -71,8 +72,9 @@
 |------|--------|--------|------|
 | **LaMa** | 本 Demo `.venv` | 整图降采样 | 默认、快、稳 |
 | **PowerPaint** | 旁路 `iopaint-bench/.venv` 常驻进程 | 按 Mask 裁 ROI 再修 | 门口/结构更清晰；大面积人可能编出新人 |
+| **Qwen-Edit** | 旁路 `qwen-edit-bench/.venv` 按需加载 | ROI + prompt，仅 Mask 贴回 | 指令编辑；3090 用 NF4，勿与 PowerPaint 同时常驻 |
 
-以后加 SDXL 等同理：在 `backends/` 加一个类，注册进 `BACKENDS`。不要把 IOPaint 装进本目录 `.venv`。
+以后加模型等同理：在 `backends/` 加一个类，注册进 `BACKENDS`。不要把 IOPaint / Qwen 装进本目录 `.venv`。
 
 PowerPaint 首次点击会加载模型（约 1～2 分钟），之后进程常驻，再点只需几十秒。
 
@@ -89,6 +91,12 @@ PowerPaint 首次点击会加载模型（约 1～2 分钟），之后进程常�
 | `POWERPAINT_MARGIN` | `256` | ROI 相对 Mask 外扩像素 |
 | `INPAINT_MODEL` | `LaMa` | 启动时默认模型 |
 | `IOPAINT_BENCH` | `../iopaint-bench` | 旁路评测台路径 |
+| `ENABLE_QWEN_EDIT` | `auto` | 旁路 python 存在则注册 Qwen-Edit |
+| `QWEN_EDIT_DEVICE` | `auto` | `cuda` / `mps` / `cpu` |
+| `QWEN_EDIT_MAX_SIDE` | `768` | Qwen-Edit ROI 最长边 |
+| `QWEN_EDIT_BENCH` | `../qwen-edit-bench` | Qwen worker 目录 |
+| `QWEN_EDIT_DRY_RUN` | `0` | `1` 时不加载权重，只测协议 |
+| `WARMUP_QWEN` | `0` | `1` 才在启动时预加载 Qwen |
 
 ```bash
 LAMA_DEVICE=cpu SAM_DEVICE=mps ./start.sh
@@ -102,7 +110,7 @@ PORT=7861 MAX_INFER_SIDE=2048 ./start.sh
 2. （可选）笔刷精修画板 Mask
 3. 按所选模型修复：
    - LaMa：Mask 膨胀后按「推理最长边」降采样，整图修复后羽化贴回
-   - PowerPaint：按 Mask 外扩裁 ROI → 旁路进程推理 → 仅 Mask 区域贴回原图
+   - PowerPaint / Qwen-Edit：按 Mask 外扩裁 ROI → 旁路进程推理 → 仅 Mask 区域贴回原图
 4. 输出原分辨率结果
 
 ## 注意事项
@@ -112,3 +120,7 @@ PORT=7861 MAX_INFER_SIDE=2048 ./start.sh
 - TorchScript LaMa 在 MPS 上可能块状伪影，默认 CPU；SAM 可尝试 `SAM_DEVICE=mps`
 - PowerPaint 在部分门口更清晰，但大面积人、近景人可能编出新人或碎块，不能无脑替换 LaMa
 - `.venv` / `.cache` / `output` 不纳入 Git
+
+## 相关文档
+
+- [服务器现状与接入 Qwen-Image-Edit-2511](docs/接入Qwen-Image-Edit-2511.md)

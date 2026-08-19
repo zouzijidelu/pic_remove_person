@@ -1,4 +1,4 @@
-"""PowerPaint：经旁路 iopaint-bench 进程推理，不装进 Demo 的 .venv。"""
+"""Qwen-Image-Edit-2511：经旁路 qwen-edit-bench 进程推理，不装进 Demo 的 .venv。"""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import atexit
 import json
 import os
 import subprocess
+import sys
 import threading
 from pathlib import Path
 
@@ -14,18 +15,20 @@ from PIL import Image
 from .roi import crop_roi, paste_roi
 
 ROOT = Path(__file__).resolve().parents[1]
-BENCH_DEFAULT = ROOT.parent / "iopaint-bench"
-MODEL_ID = "Sanster/PowerPaint-V1-stable-diffusion-inpainting"
-READY_TIMEOUT = int(os.environ.get("POWERPAINT_READY_TIMEOUT", "600"))
-INFER_TIMEOUT = int(os.environ.get("POWERPAINT_INFER_TIMEOUT", "300"))
+BENCH_DEFAULT = ROOT.parent / "qwen-edit-bench"
+READY_TIMEOUT = int(os.environ.get("QWEN_EDIT_READY_TIMEOUT", "1800"))
+INFER_TIMEOUT = int(os.environ.get("QWEN_EDIT_INFER_TIMEOUT", "600"))
+DEFAULT_PROMPT = (
+    "Remove the person. Reconstruct the background only. Do not add new people."
+)
 
 
 def bench_root() -> Path:
-    return Path(os.environ.get("IOPAINT_BENCH", BENCH_DEFAULT)).resolve()
+    return Path(os.environ.get("QWEN_EDIT_BENCH", BENCH_DEFAULT)).resolve()
 
 
 def pick_device() -> str:
-    force = os.environ.get("POWERPAINT_DEVICE", "auto").strip().lower()
+    force = os.environ.get("QWEN_EDIT_DEVICE", "auto").strip().lower()
     if force in {"cpu", "cuda", "mps"}:
         return force
     try:
@@ -42,20 +45,29 @@ def pick_device() -> str:
 
 def _python() -> Path:
     py = bench_root() / ".venv" / "bin" / "python"
-    if not py.exists():
-        raise FileNotFoundError(
-            "未找到 iopaint-bench 虚拟环境。请先：cd ../iopaint-bench && ./setup.sh"
-        )
-    return py
+    if py.exists():
+        return py
+    if _dry_run():
+        demo_py = ROOT / ".venv" / "bin" / "python"
+        if demo_py.exists():
+            return demo_py
+        return Path(sys.executable)
+    raise FileNotFoundError(
+        "未找到 qwen-edit-bench 虚拟环境。请先：cd ../qwen-edit-bench && ./setup.sh"
+    )
 
 
-class PowerPaintBackend:
-    name = "PowerPaint"
+def _dry_run() -> bool:
+    return os.environ.get("QWEN_EDIT_DRY_RUN", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
+class QwenEditBackend:
+    name = "Qwen-Edit"
 
     def __init__(self) -> None:
         self._proc: subprocess.Popen | None = None
         self._lock = threading.Lock()
-        self._tmp = ROOT / "output" / ".pp_tmp"
+        self._tmp = ROOT / "output" / ".qwen_tmp"
         self._tmp.mkdir(parents=True, exist_ok=True)
         atexit.register(self.close)
 
@@ -78,7 +90,7 @@ class PowerPaintBackend:
     def _read_json(self, timeout: int) -> dict:
         proc = self._proc
         if proc is None or proc.stdout is None:
-            raise RuntimeError("PowerPaint worker 未启动")
+            raise RuntimeError("Qwen-Edit worker 未启动")
         line = ""
 
         def _read() -> None:
@@ -89,10 +101,10 @@ class PowerPaintBackend:
         t.start()
         t.join(timeout)
         if t.is_alive():
-            raise TimeoutError(f"等待 PowerPaint worker 超时（{timeout}s）")
+            raise TimeoutError(f"等待 Qwen-Edit worker 超时（{timeout}s）")
         if not line:
             code = proc.poll()
-            raise RuntimeError(f"PowerPaint worker 已退出（code={code}），请看启动 Demo 的终端日志")
+            raise RuntimeError(f"Qwen-Edit worker 已退出（code={code}），请看启动 Demo 的终端日志")
         return json.loads(line)
 
     def _ensure_worker(self) -> None:
@@ -104,12 +116,12 @@ class PowerPaintBackend:
         release_other_heavy_backends(self.name)
 
         bench = bench_root()
-        worker = bench / "inpaint_worker.py"
-        config = bench / "configs" / "powerpaint_fast.json"
+        worker = bench / "edit_worker.py"
+        config = bench / "configs" / "qwen_fast.json"
         if not worker.exists():
             raise FileNotFoundError(f"缺少 worker 脚本: {worker}")
         if not config.exists():
-            raise FileNotFoundError(f"缺少 PowerPaint 配置: {config}")
+            raise FileNotFoundError(f"缺少 Qwen-Edit 配置: {config}")
 
         env = os.environ.copy()
         env["PYTHONUNBUFFERED"] = "1"
@@ -120,18 +132,12 @@ class PowerPaintBackend:
         env.pop("TORCH_HOME", None)
 
         device = pick_device()
-        print(f"[powerpaint] starting worker model={MODEL_ID} device={device} bench={bench}")
+        cmd = [str(_python()), str(worker), "--device", device, "--config", str(config)]
+        if _dry_run():
+            cmd.append("--dry-run")
+        print(f"[qwen-edit] starting worker device={device} dry_run={_dry_run()} bench={bench}")
         self._proc = subprocess.Popen(
-            [
-                str(_python()),
-                str(worker),
-                "--model",
-                MODEL_ID,
-                "--device",
-                device,
-                "--config",
-                str(config),
-            ],
+            cmd,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=None,
@@ -144,8 +150,8 @@ class PowerPaintBackend:
         msg = self._read_json(READY_TIMEOUT)
         if not msg.get("ok"):
             self.close()
-            raise RuntimeError(f"PowerPaint 加载失败: {msg.get('error', msg)}")
-        print(f"[powerpaint] worker ready: {msg}")
+            raise RuntimeError(f"Qwen-Edit 加载失败: {msg.get('error', msg)}")
+        print(f"[qwen-edit] worker ready: {msg}")
 
     def _call_worker(self, image: Image.Image, mask: Image.Image) -> Image.Image:
         img_p = self._tmp / "roi.png"
@@ -155,6 +161,7 @@ class PowerPaintBackend:
             out_p.unlink()
         image.save(img_p)
         mask.save(mask_p)
+        prompt = os.environ.get("QWEN_EDIT_PROMPT", DEFAULT_PROMPT).strip() or DEFAULT_PROMPT
 
         assert self._proc is not None and self._proc.stdin is not None
         self._proc.stdin.write(
@@ -164,6 +171,7 @@ class PowerPaintBackend:
                     "image": str(img_p),
                     "mask": str(mask_p),
                     "output": str(out_p),
+                    "prompt": prompt,
                     "max_side": 0,
                 },
                 ensure_ascii=False,
@@ -173,16 +181,16 @@ class PowerPaintBackend:
         self._proc.stdin.flush()
         msg = self._read_json(INFER_TIMEOUT)
         if not msg.get("ok"):
-            raise RuntimeError(f"PowerPaint 推理失败: {msg.get('error', msg)}")
+            raise RuntimeError(f"Qwen-Edit 推理失败: {msg.get('error', msg)}")
         if not out_p.exists():
-            raise RuntimeError("PowerPaint 未写出结果图")
+            raise RuntimeError("Qwen-Edit 未写出结果图")
         return Image.open(out_p).convert("RGB")
 
     def inpaint(self, image: Image.Image, mask: Image.Image, max_side: int) -> Image.Image:
-        margin = int(os.environ.get("POWERPAINT_MARGIN", "256"))
+        margin = int(os.environ.get("QWEN_EDIT_MARGIN", "256"))
         roi_img, roi_mask, bbox, scale = crop_roi(image, mask, margin=margin, max_side=int(max_side))
         print(
-            f"[powerpaint] original={image.size} roi={roi_img.size} "
+            f"[qwen-edit] original={image.size} roi={roi_img.size} "
             f"bbox={bbox} scale={scale:.3f} device={pick_device()}"
         )
         with self._lock:
@@ -195,5 +203,8 @@ class PowerPaintBackend:
         return paste_roi(image, roi_out, bbox, mask)
 
     def warmup(self) -> None:
+        if os.environ.get("WARMUP_QWEN", "0").strip() != "1":
+            print("[qwen-edit] skip warmup（WARMUP_QWEN!=1，首次使用时再加载）")
+            return
         with self._lock:
             self._ensure_worker()
