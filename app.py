@@ -5,7 +5,6 @@ from __future__ import annotations
 import os
 import re
 import threading
-import time
 import uuid
 from collections import OrderedDict
 from datetime import datetime
@@ -19,6 +18,7 @@ import torch
 from PIL import Image
 
 from backends import get_backend, list_backend_names
+from backends.profile import StageClock, format_resources, reset_torch_peak
 
 ROOT = Path(__file__).resolve().parent
 RESOURCE_DIR = ROOT / "resource"
@@ -600,10 +600,13 @@ def remove_person(
     source_stem: str,
     progress=gr.Progress(),
 ):
+    clock = StageClock()
+    reset_torch_peak()
     progress(0.05, desc="读取原图...")
     original = _to_pil_rgb(original_img)
     if original is None:
         raise gr.Error("请先上传全景原图（左侧「原图」）")
+    clock.tick("read")
 
     progress(0.15, desc="解析 Mask...")
     brush_mask = _extract_brush_mask(editor_value, original.size)
@@ -623,39 +626,48 @@ def remove_person(
 
     mask = dilate_mask(mask, int(dilate_px))
     mask_bin = mask.point(lambda p: 255 if p > 127 else 0)
+    clock.tick("mask")
 
     backend = get_backend(model_name)
     progress(0.3, desc=f"{backend.name} 准备中（最长边≤{int(max_side)}）...")
     print(f"[inpaint] model={backend.name} original={original.size} max_side={int(max_side)}")
 
     progress(0.45, desc=f"{backend.name} 消除中（进度会停在这直到推理结束）...")
-    t0 = time.perf_counter()
     try:
         result = backend.inpaint(original, mask_bin, int(max_side))
     except FileNotFoundError as e:
         raise gr.Error(str(e)) from e
     except Exception as e:
         raise gr.Error(f"{backend.name} 失败：{e}") from e
-    infer_s = time.perf_counter() - t0
-    print(f"[inpaint] {backend.name} inpaint {infer_s:.1f}s original={original.size} max_side={int(max_side)}")
+    clock.tick("inpaint")
 
-    progress(0.9, desc="保存结果...")
+    progress(0.85, desc="保存结果...")
     stem = source_stem if source_stem and source_stem != "upload" else _image_stem(original_img)
     out_path, mask_path = _output_paths(stem, backend.name)
-    t1 = time.perf_counter()
     result.save(out_path, quality=95)
     mask_bin.save(mask_path)
+    jpeg_mb = out_path.stat().st_size / (1024 * 1024)
+    clock.tick("save")
+
+    progress(0.95, desc="准备预览...")
+    mask_prev = _preview_size(mask_bin.convert("RGB"))
+    clock.tick("preview")
+    res = format_resources()
+    print(
+        f"[profile] {backend.name} {clock.summary()} | "
+        f"jpeg={jpeg_mb:.1f}MB {result.size[0]}x{result.size[1]} | {res}"
+    )
     print(
         f"[inpaint] saved {out_path.name} mask={mask_path.name} "
-        f"size={result.size} model={backend.name} save={time.perf_counter() - t1:.1f}s"
+        f"size={result.size} model={backend.name}"
     )
 
     progress(1.0, desc="完成")
-    return (
-        result,
-        _preview_size(mask_bin.convert("RGB")),
-        f"{backend.name} 完成 {result.size[0]}×{result.size[1]}，已保存 {out_path.name}",
+    status = (
+        f"{backend.name} 完成 {result.size[0]}×{result.size[1]} | "
+        f"{clock.summary()} | jpeg={jpeg_mb:.1f}MB | 已保存 {out_path.name}"
     )
+    return str(out_path), mask_prev, status
 
 
 def load_original(img, session_id):
@@ -796,7 +808,7 @@ with gr.Blocks(title="全景人像消除 · SAM + 可切换修复模型") as dem
                 )
 
         with gr.Column(scale=1):
-            result = gr.Image(label="消除结果（原图像素）", type="pil", format="jpeg", height=420)
+            result = gr.Image(label="消除结果（原分辨率 JPEG）", type="filepath", height=420)
             mask_preview = gr.Image(label="最终 Mask 预览", type="pil", height=200)
 
     _examples = list_resource_examples()

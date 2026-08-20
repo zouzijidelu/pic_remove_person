@@ -8,6 +8,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
 from PIL import Image
@@ -188,19 +189,31 @@ class QwenEditBackend:
 
     def inpaint(self, image: Image.Image, mask: Image.Image, max_side: int) -> Image.Image:
         margin = int(os.environ.get("QWEN_EDIT_MARGIN", "256"))
+        t0 = time.perf_counter()
         roi_img, roi_mask, bbox, scale = crop_roi(image, mask, margin=margin, max_side=int(max_side))
+        crop_s = time.perf_counter() - t0
         print(
             f"[qwen-edit] original={image.size} roi={roi_img.size} "
-            f"bbox={bbox} scale={scale:.3f} device={pick_device()}"
+            f"bbox={bbox} scale={scale:.3f} device={pick_device()} crop={crop_s:.2f}s"
         )
         with self._lock:
             try:
+                t1 = time.perf_counter()
                 self._ensure_worker()
+                ready_s = time.perf_counter() - t1
+                t2 = time.perf_counter()
                 roi_out = self._call_worker(roi_img, roi_mask)
+                worker_s = time.perf_counter() - t2
             except Exception:
                 self.close()
                 raise
-        return paste_roi(image, roi_out, bbox, mask)
+        t3 = time.perf_counter()
+        out = paste_roi(image, roi_out, bbox, mask)
+        print(
+            f"[qwen-edit] ensure_worker={ready_s:.2f}s worker={worker_s:.2f}s "
+            f"paste_roi={time.perf_counter() - t3:.2f}s"
+        )
+        return out
 
     def warmup(self) -> None:
         if os.environ.get("WARMUP_QWEN", "0").strip() != "1":
