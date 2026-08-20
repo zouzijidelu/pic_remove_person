@@ -4,11 +4,26 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT"
 
+load_server_env() {
+  local f="$1" line k v
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%$'\r'}"
+    [[ -z "${line// }" ]] && continue
+    [[ "$line" =~ ^[[:space:]]*# ]] && continue
+    k="${line%%=*}"
+    v="${line#*=}"
+    [[ "$k" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+    if [[ ${#v} -ge 2 && ${v:0:1} == '"' && ${v: -1} == '"' ]]; then
+      v="${v:1:${#v}-2}"
+    elif [[ ${#v} -ge 2 && ${v:0:1} == "'" && ${v: -1} == "'" ]]; then
+      v="${v:1:${#v}-2}"
+    fi
+    export "$k=$v"
+  done < "$f"
+}
+
 if [[ -f "$ROOT/server.env" ]]; then
-  set -a
-  # shellcheck disable=SC1091
-  source "$ROOT/server.env"
-  set +a
+  load_server_env "$ROOT/server.env"
 fi
 
 if [[ ! -d .venv ]]; then

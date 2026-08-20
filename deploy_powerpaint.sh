@@ -64,10 +64,11 @@ fi
 touch "$ENVF"
 set_kv() {
   local k="$1" v="$2"
+  local line="${k}=\"${v}\""
   if grep -q "^${k}=" "$ENVF"; then
-    sed -i "s|^${k}=.*|${k}=${v}|" "$ENVF"
+    sed -i "s|^${k}=.*|${line}|" "$ENVF"
   else
-    echo "${k}=${v}" >> "$ENVF"
+    echo "$line" >> "$ENVF"
   fi
 }
 set_kv ENABLE_POWERPAINT 1
