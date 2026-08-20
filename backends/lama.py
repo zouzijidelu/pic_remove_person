@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import time
 from functools import lru_cache
 
 import numpy as np
@@ -39,10 +40,14 @@ def run_lama(image: Image.Image, mask: Image.Image) -> Image.Image:
     orig_w, orig_h = image.size
     img_t, mask_t = prepare_img_and_mask(image, mask, lama.device, pad_out_to_modulo=8)
 
+    t0 = time.perf_counter()
     with torch.inference_mode():
         inpainted = lama.model(img_t, mask_t)
+        if lama.device.type == "cuda":
+            torch.cuda.synchronize()
         out = inpainted[0].permute(1, 2, 0).detach().cpu().numpy()
         out = np.clip(out * 255, 0, 255).astype(np.uint8)
+    print(f"[lama] gpu_infer {time.perf_counter() - t0:.1f}s tensor={tuple(img_t.shape)} device={lama.device}")
 
     out = out[:orig_h, :orig_w]
     return Image.fromarray(out, mode="RGB")
@@ -55,7 +60,10 @@ class LamaBackend:
         infer_img, infer_mask, scale = resize_for_infer(image, mask, int(max_side))
         print(f"[lama] original={image.size} infer={infer_img.size} scale={scale:.3f} device={pick_device()}")
         inpainted = run_lama(infer_img, infer_mask)
-        return paste_back(image, inpainted, mask)
+        t0 = time.perf_counter()
+        out = paste_back(image, inpainted, mask)
+        print(f"[lama] paste_back {time.perf_counter() - t0:.1f}s {infer_img.size} → {image.size}")
+        return out
 
     def warmup(self) -> None:
         get_lama()

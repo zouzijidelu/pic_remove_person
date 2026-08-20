@@ -59,20 +59,55 @@ def crop_roi(
 
 
 def paste_back(original: Image.Image, inpainted_small: Image.Image, mask_full: Image.Image) -> Image.Image:
-    """把降采样修复结果仅在 Mask 区域羽化贴回原图。"""
+    """把降采样修复结果仅在 Mask 区域羽化贴回原图。
+
+    全景 6720 上不要把整图 LANCZOS 拉回原尺寸：人像只占一小块时，那一步比 LaMa 推理还慢。
+    """
     if inpainted_small.size == original.size:
         return inpainted_small
 
-    up = inpainted_small.resize(original.size, Image.Resampling.LANCZOS)
-    orig = np.array(original.convert("RGB"))
+    ow, oh = original.size
+    sw, sh = inpainted_small.size
+    if sw <= 0 or sh <= 0:
+        return original.convert("RGB")
+
+    mask_l = mask_full.convert("L")
+    if mask_l.size != (ow, oh):
+        mask_l = mask_l.resize((ow, oh), Image.Resampling.NEAREST)
+
+    # 羽化 sigma=2，多留几像素避免接缝
+    bbox = mask_bbox(mask_l, margin=16)
+    if bbox is None:
+        return original.convert("RGB")
+    x1, y1, x2, y2 = bbox
+    box_area = (x2 - x1) * (y2 - y1)
+    if box_area <= 0:
+        return original.convert("RGB")
+
+    scale_x = sw / float(ow)
+    scale_y = sh / float(oh)
+    sx1 = max(0, int(x1 * scale_x))
+    sy1 = max(0, int(y1 * scale_y))
+    sx2 = min(sw, max(sx1 + 1, int(np.ceil(x2 * scale_x))))
+    sy2 = min(sh, max(sy1 + 1, int(np.ceil(y2 * scale_y))))
+
+    orig = original.convert("RGB")
+    crop_w, crop_h = x2 - x1, y2 - y1
+    up = inpainted_small.crop((sx1, sy1, sx2, sy2)).resize(
+        (crop_w, crop_h), Image.Resampling.LANCZOS
+    )
+    orig_crop = np.array(orig.crop((x1, y1, x2, y2)))
     up_arr = np.array(up.convert("RGB"))
-    m = np.array(mask_full.resize(original.size, Image.Resampling.NEAREST))
+    m = np.array(mask_l.crop((x1, y1, x2, y2)))
     m_f = (m.astype(np.float32) / 255.0)[..., None]
     if m_f.max() > 0:
         m_blur = cv2.GaussianBlur(m.astype(np.float32), (0, 0), sigmaX=2)
         m_f = (m_blur / 255.0)[..., None]
-    blended = orig.astype(np.float32) * (1.0 - m_f) + up_arr.astype(np.float32) * m_f
-    return Image.fromarray(np.clip(blended, 0, 255).astype(np.uint8), mode="RGB")
+    blended = orig_crop.astype(np.float32) * (1.0 - m_f) + up_arr.astype(np.float32) * m_f
+    patch = Image.fromarray(np.clip(blended, 0, 255).astype(np.uint8), mode="RGB")
+    out = orig.copy()
+    out.paste(patch, (x1, y1))
+    return out
 
 
 def match_inpaint_to_surroundings(

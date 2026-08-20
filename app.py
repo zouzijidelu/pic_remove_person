@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import re
 import threading
+import time
 import uuid
 from collections import OrderedDict
 from datetime import datetime
@@ -627,19 +628,27 @@ def remove_person(
     progress(0.3, desc=f"{backend.name} 准备中（最长边≤{int(max_side)}）...")
     print(f"[inpaint] model={backend.name} original={original.size} max_side={int(max_side)}")
 
-    progress(0.45, desc=f"{backend.name} 消除中...")
+    progress(0.45, desc=f"{backend.name} 消除中（进度会停在这直到推理结束）...")
+    t0 = time.perf_counter()
     try:
         result = backend.inpaint(original, mask_bin, int(max_side))
     except FileNotFoundError as e:
         raise gr.Error(str(e)) from e
     except Exception as e:
         raise gr.Error(f"{backend.name} 失败：{e}") from e
+    infer_s = time.perf_counter() - t0
+    print(f"[inpaint] {backend.name} inpaint {infer_s:.1f}s original={original.size} max_side={int(max_side)}")
 
+    progress(0.9, desc="保存结果...")
     stem = source_stem if source_stem and source_stem != "upload" else _image_stem(original_img)
     out_path, mask_path = _output_paths(stem, backend.name)
+    t1 = time.perf_counter()
     result.save(out_path, quality=95)
     mask_bin.save(mask_path)
-    print(f"[inpaint] saved {out_path.name} mask={mask_path.name} size={result.size} model={backend.name}")
+    print(
+        f"[inpaint] saved {out_path.name} mask={mask_path.name} "
+        f"size={result.size} model={backend.name} save={time.perf_counter() - t1:.1f}s"
+    )
 
     progress(1.0, desc="完成")
     return (
