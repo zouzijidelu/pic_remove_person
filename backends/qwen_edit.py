@@ -75,18 +75,30 @@ class QwenEditBackend:
     def close(self) -> None:
         proc = self._proc
         self._proc = None
-        if proc is None or proc.poll() is not None:
+        if proc is None:
             return
+        if proc.poll() is None:
+            try:
+                if proc.stdin:
+                    proc.stdin.write('{"cmd":"quit"}\n')
+                    proc.stdin.flush()
+            except Exception:
+                pass
+            try:
+                proc.wait(timeout=8)
+            except Exception:
+                try:
+                    proc.kill()
+                    proc.wait(timeout=3)
+                except Exception:
+                    pass
         try:
-            if proc.stdin:
-                proc.stdin.write('{"cmd":"quit"}\n')
-                proc.stdin.flush()
+            import torch
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
         except Exception:
             pass
-        try:
-            proc.wait(timeout=5)
-        except Exception:
-            proc.kill()
 
     def _read_json(self, timeout: int) -> dict:
         proc = self._proc
@@ -128,6 +140,9 @@ class QwenEditBackend:
         env["PYTHONUNBUFFERED"] = "1"
         env["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
         env["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+        env["PYTORCH_CUDA_ALLOC_CONF"] = os.environ.get(
+            "PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True"
+        )
         env["HF_HOME"] = str(bench / ".cache" / "huggingface")
         env["HUGGINGFACE_HUB_CACHE"] = str(bench / ".cache" / "huggingface" / "hub")
         env.pop("TORCH_HOME", None)

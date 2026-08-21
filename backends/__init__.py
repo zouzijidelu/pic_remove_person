@@ -69,7 +69,7 @@ def get_backend(name: str):
 
 
 def release_other_heavy_backends(keep: str) -> None:
-    """3090 上 PowerPaint 与 Qwen 互斥常驻，用谁加载谁。"""
+    """PowerPaint 与 Qwen 互斥常驻，用谁加载谁。"""
     for name in HEAVY_BACKENDS:
         if name == keep:
             continue
@@ -81,3 +81,18 @@ def release_other_heavy_backends(keep: str) -> None:
             continue
         print(f"[backends] 释放 {name}，避免与 {keep} 同时占显存")
         close()
+        _INSTANCES.pop(name, None)
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+    try:
+        from .profile import nvidia_smi, format_resources
+
+        smi = nvidia_smi()
+        print(f"[backends] 释放后 GPU {format_resources(smi=smi)}")
+    except Exception:
+        pass

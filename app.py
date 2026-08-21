@@ -644,7 +644,7 @@ def remove_person(
     progress(0.85, desc="保存结果...")
     stem = source_stem if source_stem and source_stem != "upload" else _image_stem(original_img)
     out_path, mask_path = _output_paths(stem, backend.name)
-    result.save(out_path, quality=95)
+    result.save(out_path, quality=95, subsampling=0)
     mask_bin.save(mask_path)
     jpeg_mb = out_path.stat().st_size / (1024 * 1024)
     clock.tick("save")
@@ -667,7 +667,7 @@ def remove_person(
         f"{backend.name} 完成 {result.size[0]}×{result.size[1]} | "
         f"{clock.summary()} | jpeg={jpeg_mb:.1f}MB | 已保存 {out_path.name}"
     )
-    return str(out_path), mask_prev, status
+    return str(out_path), str(out_path), mask_prev, status
 
 
 def load_original(img, session_id):
@@ -732,7 +732,7 @@ with gr.Blocks(title="全景人像消除 · SAM + 可切换修复模型") as dem
            - **SAM 点选**：单击人像  
            - **矩形框**：点两个**对角点**定框（会出现青色矩形）  
         3. 需要修边时再展开「笔刷精修」，点「载入当前 Mask 到笔刷」  
-        4. 选修复模型后开始消除 → `output/原图名_模型_时间.jpg`  
+        4. 选修复模型后开始消除 → 右侧预览仅供查看；**下载请用「下载服务器原文件」**（上方图片自带的下载会被 Gradio 再压缩）  
            Mask 留在服务端，点选只回传 960 预览。
         """
     )
@@ -808,7 +808,11 @@ with gr.Blocks(title="全景人像消除 · SAM + 可切换修复模型") as dem
                 )
 
         with gr.Column(scale=1):
-            result = gr.Image(label="消除结果（原分辨率 JPEG）", type="filepath", height=420)
+            result = gr.Image(label="消除结果预览（页面会再压缩，勿用这里的下载）", type="filepath", height=420)
+            result_file = gr.File(
+                label="下载服务器原文件（原分辨率 JPEG，未经页面再压缩）",
+                type="filepath",
+            )
             mask_preview = gr.Image(label="最终 Mask 预览", type="pil", height=200)
 
     _examples = list_resource_examples()
@@ -878,7 +882,7 @@ with gr.Blocks(title="全景人像消除 · SAM + 可切换修复模型") as dem
     run_btn.click(
         fn=remove_person,
         inputs=[original, editor, session_id, dilate_px, max_side, model_name, source_stem_state],
-        outputs=[result, mask_preview, status],
+        outputs=[result, result_file, mask_preview, status],
     )
 
 

@@ -38,6 +38,7 @@ PYTHON="$ROOT/.venv/bin/python"
 export TORCH_HOME="$ROOT/.cache/torch"
 export HF_HOME="$ROOT/.cache/huggingface"
 export PYTHONUNBUFFERED=1
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 # 避免系统代理导致 Gradio 本地 startup-events 502
 export NO_PROXY="127.0.0.1,localhost,::1"
 export no_proxy="127.0.0.1,localhost,::1"
